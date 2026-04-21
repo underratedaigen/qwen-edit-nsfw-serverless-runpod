@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Sequence
 
+import numpy as np
 import requests
 import torch
 from huggingface_hub import InferenceClient, hf_hub_download
@@ -113,6 +114,118 @@ IDENTITY_LOCK_NEGATIVE_PROMPT = (
     "beautified face, retouched face, distorted face, asymmetrical face, malformed face, duplicated face"
 )
 
+COMPOSITION_LOCK_INSTRUCTION = (
+    "Preserve the original camera framing and composition exactly as in the source image. "
+    "Keep the same crop, field of view, camera distance, perspective, pose, subject scale, head size, body size, "
+    "and visible body extent unless the user explicitly requests a reframed shot or pose change. "
+    "Do not zoom in, zoom out, crop tighter, widen the shot, or shift the subject inward."
+)
+
+COMPOSITION_LOCK_NEGATIVE_PROMPT = (
+    "zoomed in, tighter crop, close-up crop, reframed composition, changed framing, changed camera distance, "
+    "different field of view, larger head, larger face, larger subject, smaller visible body, cropped shoulders, "
+    "cropped limbs, cropped top of head"
+)
+
+REFRAMING_HINTS = (
+    "zoom in",
+    "zoom-in",
+    "zoomed in",
+    "zoom out",
+    "zoom-out",
+    "wider shot",
+    "wide shot",
+    "medium shot",
+    "close-up",
+    "close up",
+    "full body",
+    "full-body",
+    "tighter crop",
+    "crop tighter",
+    "reframe",
+    "re-fram",
+    "change framing",
+    "different framing",
+    "change composition",
+    "different composition",
+    "move closer",
+    "move farther",
+    "closer to camera",
+    "farther from camera",
+    "different pose",
+    "new pose",
+    "change pose",
+    "reposition",
+    "change position",
+    "different position",
+    "turn around",
+    "turn sideways",
+    "side profile",
+    "profile view",
+    "back view",
+    "facing away",
+    "look away",
+    "lean back",
+    "lean forward",
+    "sitting",
+    "standing",
+    "walking",
+    "running",
+    "jumping",
+    "dancing",
+)
+
+REFRAMING_VERBS = (
+    "raise",
+    "lift",
+    "move",
+    "turn",
+    "rotate",
+    "bend",
+    "lean",
+    "sit",
+    "stand",
+    "kneel",
+    "crouch",
+    "lie",
+    "lay",
+    "walk",
+    "run",
+    "jump",
+    "dance",
+    "step",
+)
+
+REFRAMING_TARGETS = (
+    "arm",
+    "arms",
+    "hand",
+    "hands",
+    "leg",
+    "legs",
+    "body",
+    "torso",
+    "hip",
+    "hips",
+    "shoulder",
+    "shoulders",
+    "head",
+    "pose",
+    "position",
+)
+
+
+@dataclass(frozen=True)
+class CanvasPadding:
+    source_width: int
+    source_height: int
+    padded_width: int
+    padded_height: int
+    left: int
+    top: int
+    right: int
+    bottom: int
+
 
 def _to_bool(value: Any, default: bool = False) -> bool:
     if value is None:
@@ -150,26 +263,39 @@ def _listify(value: Any) -> List[Any]:
     return [value]
 
 
-def _merge_prompt(user_prompt: str, enforce_identity_lock: bool) -> str:
-    if not enforce_identity_lock:
-        return user_prompt.strip()
-
+def _merge_prompt(user_prompt: str, enforce_identity_lock: bool, preserve_composition: bool) -> str:
     prompt = user_prompt.strip()
+    requirements: list[str] = []
+    if preserve_composition:
+        requirements.append(COMPOSITION_LOCK_INSTRUCTION)
+    if enforce_identity_lock:
+        requirements.append(IDENTITY_LOCK_INSTRUCTION)
+
+    if not requirements:
+        return prompt
+
     if not prompt:
-        return IDENTITY_LOCK_INSTRUCTION
+        return "\n\n".join(f"Hard requirement: {requirement}" for requirement in requirements)
 
-    return f"{prompt}\n\nAdditional hard requirement: {IDENTITY_LOCK_INSTRUCTION}"
+    merged_requirements = "\n".join(f"Additional hard requirement: {requirement}" for requirement in requirements)
+    return f"{prompt}\n\n{merged_requirements}"
 
 
-def _merge_negative_prompt(user_negative_prompt: str, enforce_identity_lock: bool) -> str:
+def _merge_negative_prompt(user_negative_prompt: str, enforce_identity_lock: bool, preserve_composition: bool) -> str:
     base_negative = user_negative_prompt.strip()
-    if not enforce_identity_lock:
+    additions: list[str] = []
+    if preserve_composition:
+        additions.append(COMPOSITION_LOCK_NEGATIVE_PROMPT)
+    if enforce_identity_lock:
+        additions.append(IDENTITY_LOCK_NEGATIVE_PROMPT)
+
+    if not additions:
         return base_negative or " "
 
     if not base_negative:
-        return IDENTITY_LOCK_NEGATIVE_PROMPT
+        return ", ".join(additions)
 
-    return f"{base_negative}, {IDENTITY_LOCK_NEGATIVE_PROMPT}"
+    return f"{base_negative}, {', '.join(additions)}"
 
 
 def _cache_root_candidates() -> List[Path]:
@@ -265,6 +391,17 @@ def _infer_prompt_intent(prompt: str) -> str:
     if any(keyword in lowered for keyword in background_keywords):
         return "background"
     return "general"
+
+
+def _prompt_requests_reframing(prompt: str) -> bool:
+    lowered = (prompt or "").strip().lower()
+    if not lowered:
+        return False
+
+    if any(hint in lowered for hint in REFRAMING_HINTS):
+        return True
+
+    return any(verb in lowered for verb in REFRAMING_VERBS) and any(target in lowered for target in REFRAMING_TARGETS)
 
 
 def _normalize_quality_mode(value: Any) -> str:
@@ -405,6 +542,65 @@ def _resolve_source_native_size(
     internal_width = _align_dimension(source_width, size_multiple, round_up=True)
     internal_height = _align_dimension(source_height, size_multiple, round_up=True)
     return source_width, source_height, internal_width, internal_height
+
+
+def _pad_image_to_canvas(image: Image.Image, target_width: int, target_height: int) -> tuple[Image.Image, CanvasPadding | None]:
+    if image.width <= 0 or image.height <= 0:
+        return image, None
+
+    if image.size == (target_width, target_height):
+        return image, None
+
+    if target_width < image.width or target_height < image.height:
+        return image, None
+
+    left = max(0, (target_width - image.width) // 2)
+    right = max(0, target_width - image.width - left)
+    top = max(0, (target_height - image.height) // 2)
+    bottom = max(0, target_height - image.height - top)
+
+    if left == 0 and right == 0 and top == 0 and bottom == 0:
+        return image, None
+
+    image_array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    padded_array = np.pad(
+        image_array,
+        ((top, bottom), (left, right), (0, 0)),
+        mode="edge",
+    )
+    padded_image = Image.fromarray(padded_array, mode="RGB")
+    return padded_image, CanvasPadding(
+        source_width=int(image.width),
+        source_height=int(image.height),
+        padded_width=int(target_width),
+        padded_height=int(target_height),
+        left=int(left),
+        top=int(top),
+        right=int(right),
+        bottom=int(bottom),
+    )
+
+
+def _crop_image_from_canvas(image: Image.Image, canvas_padding: CanvasPadding | None) -> Image.Image:
+    if canvas_padding is None:
+        return image
+
+    if image.width <= 0 or image.height <= 0:
+        return image
+
+    scale_x = image.width / max(canvas_padding.padded_width, 1)
+    scale_y = image.height / max(canvas_padding.padded_height, 1)
+
+    left = int(round(canvas_padding.left * scale_x))
+    top = int(round(canvas_padding.top * scale_y))
+    right = int(round((canvas_padding.left + canvas_padding.source_width) * scale_x))
+    bottom = int(round((canvas_padding.top + canvas_padding.source_height) * scale_y))
+
+    left = max(0, min(left, image.width))
+    top = max(0, min(top, image.height))
+    right = max(left + 1, min(right, image.width))
+    bottom = max(top + 1, min(bottom, image.height))
+    return image.crop((left, top, right, bottom))
 
 
 def _resolve_generation_size(
@@ -1284,6 +1480,7 @@ class QwenRunpodService:
             }
 
         images = _collect_input_images(job_input)
+        model_images = list(images)
         self.ensure_loaded()
 
         seed = _to_int(job_input.get("seed"), 42)
@@ -1307,12 +1504,11 @@ class QwenRunpodService:
         )
         prompt_intent = _infer_prompt_intent(prompt)
         face_coverage = self._estimate_face_coverage(images[0]) if self.config.adaptive_generation and images else None
-
-        negative_prompt = _merge_negative_prompt(str(job_input.get("negative_prompt", " ")), enforce_identity_lock)
         requested_height = _to_optional_int(job_input.get("height"))
         requested_width = _to_optional_int(job_input.get("width"))
         preserve_source_exact_size = requested_width is None and requested_height is None and bool(images)
         source_output_size: tuple[int, int] | None = None
+        canvas_padding: CanvasPadding | None = None
         native_min_long, native_min_short, native_min_pixels, native_max_long = _resolve_native_constraints(
             quality_mode=quality_mode if self.config.adaptive_generation else self.config.quality_mode,
             face_coverage=face_coverage,
@@ -1353,6 +1549,12 @@ class QwenRunpodService:
             )
         explicit_guidance = _has_explicit_value(job_input, "true_guidance_scale")
         explicit_steps = _has_explicit_value(job_input, "num_inference_steps")
+        preserve_composition = bool(images) and not _prompt_requests_reframing(prompt)
+        negative_prompt = _merge_negative_prompt(
+            str(job_input.get("negative_prompt", " ")),
+            enforce_identity_lock,
+            preserve_composition,
+        )
         true_guidance_scale = (
             _to_float(job_input.get("true_guidance_scale"), self.config.default_true_guidance_scale)
             if explicit_guidance
@@ -1384,20 +1586,26 @@ class QwenRunpodService:
         output_format = str(job_input.get("output_format", "png")).strip().lower()
         upload_to_bucket = _to_bool(job_input.get("upload_to_bucket"), self.config.enable_bucket_uploads)
         resolved_prompt = self._rewrite_prompt(prompt, images) if rewrite_prompt else prompt
-        resolved_prompt = _merge_prompt(resolved_prompt, enforce_identity_lock)
+        resolved_prompt = _merge_prompt(resolved_prompt, enforce_identity_lock, preserve_composition)
+        if preserve_source_exact_size and len(images) == 1:
+            padded_image, canvas_padding = _pad_image_to_canvas(images[0], width, height)
+            if canvas_padding is not None:
+                model_images = [padded_image]
         print(
             f"[generation] native size {width}x{height}, steps={num_inference_steps}, "
             f"true_cfg_scale={true_guidance_scale}, quality_mode={quality_mode}, "
             f"mask={face_mask_strategy}/{face_mask_mode}@{round(face_mask_strength, 3)}, "
             f"preserve_source_exact_size={preserve_source_exact_size}, "
-            f"source_output_size={source_output_size}"
+            f"source_output_size={source_output_size}, "
+            f"preserve_composition={preserve_composition}, "
+            f"canvas_padding={canvas_padding}"
         )
 
         started_at = time.time()
 
         with torch.inference_mode():
             output, generation_attempts, width, height, num_inference_steps = self._generate_with_retries(
-                images=images,
+                images=model_images,
                 prompt=resolved_prompt,
                 negative_prompt=negative_prompt,
                 seed=seed,
@@ -1409,6 +1617,8 @@ class QwenRunpodService:
             )
 
         output_images = list(output.images)
+        if canvas_padding is not None:
+            output_images = [_crop_image_from_canvas(image, canvas_padding) for image in output_images]
         face_masking: List[Dict[str, Any]]
         debug_mask_payloads: List[Dict[str, Image.Image]]
         if images:
@@ -1499,6 +1709,21 @@ class QwenRunpodService:
                 "preserve_source_exact_size": preserve_source_exact_size,
                 "source_output_width": source_output_size[0] if source_output_size else None,
                 "source_output_height": source_output_size[1] if source_output_size else None,
+                "preserve_composition": preserve_composition,
+                "canvas_padding": (
+                    {
+                        "left": canvas_padding.left,
+                        "top": canvas_padding.top,
+                        "right": canvas_padding.right,
+                        "bottom": canvas_padding.bottom,
+                        "source_width": canvas_padding.source_width,
+                        "source_height": canvas_padding.source_height,
+                        "padded_width": canvas_padding.padded_width,
+                        "padded_height": canvas_padding.padded_height,
+                    }
+                    if canvas_padding is not None
+                    else None
+                ),
                 "num_inference_steps": num_inference_steps,
                 "true_guidance_scale": true_guidance_scale,
                 "quality_mode": quality_mode,
