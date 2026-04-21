@@ -233,6 +233,8 @@ def run_inference(
         generation = output.get("generation") or {}
         face_masking = output.get("face_masking") or []
         first_mask = face_masking[0] if face_masking else {}
+        first_drift = first_mask.get("identity_drift") or {}
+        identity_retry = generation.get("identity_retry") or {}
         delivered_resolution_text = (
             f"{first_image.get('width', 'n/a')}x{first_image.get('height', 'n/a')}"
             if first_image
@@ -257,6 +259,8 @@ def run_inference(
             f"Source target: {source_target_resolution_text}\n"
             f"Generated: {generated_resolution_text}\n"
             f"Delivered: {delivered_resolution_text}\n"
+            f"Identity drift: {first_drift.get('score', 'n/a')}\n"
+            f"Identity retry: {'used' if identity_retry.get('used') else 'attempted' if identity_retry.get('attempted') else 'not needed'}\n"
             f"Face coverage: {generation.get('face_coverage', 'n/a')}\n"
             f"Attempts: {attempt_count}\n"
             f"Delay: {result.get('delayTime', 'n/a')} ms\n"

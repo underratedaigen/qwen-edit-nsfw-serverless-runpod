@@ -207,6 +207,64 @@ def _fit_affine(source_points: np.ndarray, target_points: np.ndarray) -> np.ndar
     return affine
 
 
+def _apply_transform(points: np.ndarray, affine: np.ndarray) -> np.ndarray:
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("points must be a Nx2 array")
+
+    homogenous = np.concatenate(
+        [points.astype(np.float32), np.ones((points.shape[0], 1), dtype=np.float32)],
+        axis=1,
+    )
+    transformed = (affine @ homogenous.T).T
+    return transformed[:, :2]
+
+
+def _fit_similarity(source_points: np.ndarray, target_points: np.ndarray) -> np.ndarray:
+    if source_points.shape != target_points.shape:
+        raise ValueError("source_points and target_points must have matching shapes")
+    if source_points.shape[0] < 2:
+        raise ValueError("At least two points are required for similarity alignment")
+
+    source = source_points.astype(np.float32)
+    target = target_points.astype(np.float32)
+    source_mean = source.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    source_centered = source - source_mean
+    target_centered = target - target_mean
+
+    covariance = (source_centered.T @ target_centered) / float(source.shape[0])
+    u, singular_values, vt = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+
+    if np.linalg.det(rotation) < 0:
+        vt[-1, :] *= -1
+        rotation = vt.T @ u.T
+
+    source_variance = float(np.mean(np.sum(source_centered * source_centered, axis=1)))
+    if source_variance <= 1e-6:
+        raise ValueError("source points do not have enough variance for similarity alignment")
+
+    scale = float(np.sum(singular_values) / source_variance)
+    translation = target_mean - (scale * (rotation @ source_mean))
+
+    affine = np.array(
+        [
+            [scale * rotation[0, 0], scale * rotation[0, 1], translation[0]],
+            [scale * rotation[1, 0], scale * rotation[1, 1], translation[1]],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    return affine
+
+
+def _normalized_point_error(source_points: np.ndarray, target_points: np.ndarray, affine: np.ndarray) -> float:
+    transformed = _apply_transform(source_points, affine)
+    residuals = np.linalg.norm(transformed - target_points.astype(np.float32), axis=1)
+    target_extent = np.linalg.norm(target_points.max(axis=0) - target_points.min(axis=0))
+    return float(residuals.mean() / max(float(target_extent), 1.0))
+
+
 def _warp_image(image: Image.Image, affine: np.ndarray, output_size: tuple[int, int]) -> Image.Image:
     inverse = np.linalg.inv(affine)
     coeffs = (
@@ -242,6 +300,24 @@ def _contract_mask(mask: Image.Image, contract_px: int, blur_radius: float) -> I
 
 def _mask_to_array(mask: Image.Image) -> np.ndarray:
     return (np.asarray(mask, dtype=np.float32) / 255.0)[..., None]
+
+
+def _luminance_array(image_or_array: Image.Image | np.ndarray) -> np.ndarray:
+    array = image_or_array
+    if isinstance(image_or_array, Image.Image):
+        array = np.asarray(image_or_array.convert("RGB"), dtype=np.float32)
+    elif array.dtype != np.float32:
+        array = array.astype(np.float32)
+
+    return (0.299 * array[..., 0]) + (0.587 * array[..., 1]) + (0.114 * array[..., 2])
+
+
+def _blur_rgb_array(image_or_array: Image.Image | np.ndarray, radius: float) -> np.ndarray:
+    if isinstance(image_or_array, Image.Image):
+        image = image_or_array.convert("RGB")
+    else:
+        image = Image.fromarray(np.clip(image_or_array, 0, 255).astype(np.uint8), mode="RGB")
+    return np.asarray(image.filter(ImageFilter.GaussianBlur(radius=radius)), dtype=np.float32)
 
 
 def _union_masks(*masks: Image.Image) -> Image.Image:
@@ -473,13 +549,56 @@ class FaceIdentityMasker:
         generated_landmarks = self._extract_landmarks(generated_rgb)
 
         if source_landmarks and generated_landmarks:
-            affine = _fit_affine(self._anchors(source_landmarks), self._anchors(generated_landmarks))
-            return (
-                _warp_image(source_rgb, affine, generated_rgb.size),
-                source_landmarks,
-                generated_landmarks,
-                "face_affine",
-            )
+            source_anchors = self._anchors(source_landmarks)
+            generated_anchors = self._anchors(generated_landmarks)
+
+            similarity_error: float | None = None
+            affine_error: float | None = None
+            similarity_affine: np.ndarray | None = None
+            affine_transform: np.ndarray | None = None
+
+            try:
+                similarity_affine = _fit_similarity(source_anchors, generated_anchors)
+                similarity_error = _normalized_point_error(source_anchors, generated_anchors, similarity_affine)
+            except Exception:
+                similarity_affine = None
+
+            try:
+                affine_transform = _fit_affine(source_anchors, generated_anchors)
+                affine_error = _normalized_point_error(source_anchors, generated_anchors, affine_transform)
+            except Exception:
+                affine_transform = None
+
+            chosen_transform: np.ndarray | None = None
+            chosen_method = "direct"
+            if similarity_affine is not None:
+                similarity_scale = float(
+                    (np.linalg.norm(similarity_affine[:2, 0]) + np.linalg.norm(similarity_affine[:2, 1])) / 2.0
+                )
+                if (
+                    similarity_error is not None
+                    and similarity_error <= 0.14
+                    and 0.72 <= similarity_scale <= 1.38
+                    and (
+                        affine_error is None
+                        or similarity_error <= (affine_error + 0.015)
+                        or affine_error > 0.08
+                    )
+                ):
+                    chosen_transform = similarity_affine
+                    chosen_method = f"face_similarity:{similarity_error:.4f}"
+
+            if chosen_transform is None and affine_transform is not None and affine_error is not None and affine_error <= 0.085:
+                chosen_transform = affine_transform
+                chosen_method = f"face_affine:{affine_error:.4f}"
+
+            if chosen_transform is not None:
+                return (
+                    _warp_image(source_rgb, chosen_transform, generated_rgb.size),
+                    source_landmarks,
+                    generated_landmarks,
+                    chosen_method,
+                )
 
         if source_rgb.size != generated_rgb.size:
             return (
@@ -607,17 +726,17 @@ class FaceIdentityMasker:
         if normalized_mode == "surface_fx":
             normalized_mode = "balanced"
 
-        source_landmarks = self._extract_landmarks(source_image)
+        generated_rgb = generated_image.convert("RGB")
+        aligned_source, source_landmarks, generated_landmarks, alignment_method = self._align_source_to_generated(
+            source_image,
+            generated_rgb,
+        )
         if not source_landmarks:
             return FaceMaskResult(image=generated_image, applied=False, mode=normalized_mode, reason="no-source-face", engine="legacy")
 
-        generated_rgb = generated_image.convert("RGB")
-        generated_landmarks = self._extract_landmarks(generated_rgb)
         if not generated_landmarks:
             return FaceMaskResult(image=generated_rgb, applied=False, mode=normalized_mode, reason="no-output-face", engine="legacy")
 
-        affine = _fit_affine(self._anchors(source_landmarks), self._anchors(generated_landmarks))
-        aligned_source = _warp_image(source_image, affine, generated_rgb.size)
         face_mask, core_mask, contour_mask = self._build_legacy_masks(generated_rgb.size, generated_landmarks)
 
         source_array = np.asarray(aligned_source, dtype=np.float32)
@@ -635,7 +754,7 @@ class FaceIdentityMasker:
                 mode="strict",
                 reason="legacy-strict-protection",
                 engine="legacy",
-                metadata={"strategy_used": "legacy"},
+                metadata={"strategy_used": "legacy", "alignment_method": alignment_method},
                 debug_images=self._build_legacy_debug_images(generated_rgb, aligned_source, face_mask, core_mask, contour_mask) if debug else {},
             )
 
@@ -663,7 +782,7 @@ class FaceIdentityMasker:
             mode="balanced",
             reason="legacy-balanced-protection",
             engine="legacy",
-            metadata={"strategy_used": "legacy"},
+            metadata={"strategy_used": "legacy", "alignment_method": alignment_method},
             debug_images=self._build_legacy_debug_images(generated_rgb, aligned_source, face_mask, core_mask, contour_mask) if debug else {},
         )
 
@@ -875,6 +994,183 @@ class FaceIdentityMasker:
             debug_images["parser_labels"] = region_masks["parser_labels"]
         return debug_images
 
+    def _build_highlight_lock_mask(
+        self,
+        aligned_source: Image.Image,
+        generated_image: Image.Image,
+        face_mask: Image.Image,
+    ) -> Image.Image:
+        face_array = np.asarray(face_mask, dtype=np.uint8) > 0
+        if not bool(face_array.any()):
+            return Image.new("L", aligned_source.size, 0)
+
+        base = max(aligned_source.size)
+        source_array = np.asarray(aligned_source.convert("RGB"), dtype=np.float32)
+        generated_array = np.asarray(generated_image.convert("RGB"), dtype=np.float32)
+        source_luminance = _luminance_array(source_array)
+        generated_luminance = _luminance_array(generated_array)
+
+        local_luminance = np.asarray(
+            Image.fromarray(np.clip(source_luminance, 0, 255).astype(np.uint8), mode="L").filter(
+                ImageFilter.GaussianBlur(radius=max(5.0, base / 120.0))
+            ),
+            dtype=np.float32,
+        )
+        highlight_energy = source_luminance - local_luminance
+        face_luminance = source_luminance[face_array]
+        face_energy = highlight_energy[face_array]
+
+        if face_luminance.size < 32:
+            return Image.new("L", aligned_source.size, 0)
+
+        bright_floor = float(max(np.percentile(face_luminance, 70), face_luminance.mean()))
+        energy_floor = float(max(5.0, np.percentile(face_energy, 72)))
+        luminance_gap = source_luminance - generated_luminance
+
+        highlight_mask = (
+            face_array
+            & (source_luminance >= bright_floor)
+            & (highlight_energy >= energy_floor)
+            & (luminance_gap >= 3.0)
+        )
+        if not bool(highlight_mask.any()):
+            return Image.new("L", aligned_source.size, 0)
+
+        mask = Image.fromarray((highlight_mask.astype(np.uint8) * 255), mode="L")
+        mask = _expand_mask(mask, expand_px=max(1, int(base / 520)), blur_radius=max(1.5, base / 420.0))
+        return mask
+
+    def _apply_face_tone_lock(
+        self,
+        working_array: np.ndarray,
+        source_array: np.ndarray,
+        face_mask: Image.Image,
+        radius: float,
+        strength: float,
+    ) -> tuple[np.ndarray, float]:
+        alpha = _mask_to_array(face_mask) * float(np.clip(strength, 0.0, 1.0))
+        if float(alpha.max()) <= 0.0:
+            return np.clip(working_array, 0, 255), 0.0
+
+        working_low = _blur_rgb_array(working_array, radius=radius)
+        source_low = _blur_rgb_array(source_array, radius=radius)
+        corrected = np.clip(working_array + ((source_low - working_low) * alpha), 0, 255)
+        coverage = float((np.asarray(face_mask, dtype=np.uint8) > 0).mean())
+        return corrected, coverage
+
+    def _apply_face_texture_lock(
+        self,
+        working_array: np.ndarray,
+        source_array: np.ndarray,
+        face_mask: Image.Image,
+        radius: float,
+        strength: float,
+    ) -> tuple[np.ndarray, float]:
+        alpha = _mask_to_array(face_mask) * float(np.clip(strength, 0.0, 1.0))
+        if float(alpha.max()) <= 0.0:
+            return np.clip(working_array, 0, 255), 0.0
+
+        working_low = _blur_rgb_array(working_array, radius=radius)
+        source_low = _blur_rgb_array(source_array, radius=radius)
+        working_texture = working_array - working_low
+        source_texture = source_array - source_low
+        corrected = np.clip(working_array + ((source_texture - working_texture) * alpha), 0, 255)
+        coverage = float((np.asarray(face_mask, dtype=np.uint8) > 0).mean())
+        return corrected, coverage
+
+    def assess_identity_drift(
+        self,
+        source_image: Image.Image,
+        generated_image: Image.Image,
+    ) -> Dict[str, Any]:
+        generated_rgb = generated_image.convert("RGB")
+        aligned_source, source_landmarks, generated_landmarks, alignment_method = self._align_source_to_generated(
+            source_image,
+            generated_rgb,
+        )
+
+        if not source_landmarks:
+            return {
+                "available": False,
+                "reason": "no-source-face",
+                "alignment_method": alignment_method,
+            }
+        if not generated_landmarks:
+            return {
+                "available": False,
+                "reason": "no-output-face",
+                "alignment_method": alignment_method,
+            }
+
+        source_anchors = self._anchors(source_landmarks)
+        generated_anchors = self._anchors(generated_landmarks)
+
+        try:
+            geometry_transform = _fit_similarity(source_anchors, generated_anchors)
+            geometry_error = _normalized_point_error(source_anchors, generated_anchors, geometry_transform)
+        except Exception:
+            geometry_error = 1.0
+
+        region_masks: Dict[str, Image.Image] | None = None
+        parser_face: ParserFaceData | None = None
+        try:
+            parser_face = self._parse_face_regions(generated_rgb)
+            region_masks = self._build_smart_masks(generated_rgb.size, generated_landmarks, parser_face)
+            face_mask = _subtract_masks(
+                region_masks["face"],
+                region_masks["hairline"],
+                blur_radius=max(1.0, max(generated_rgb.size) / 360.0),
+            )
+            core_mask = region_masks["core"]
+        except Exception:
+            face_mask, core_mask, _ = self._build_legacy_masks(generated_rgb.size, generated_landmarks)
+
+        face_bool = np.asarray(face_mask, dtype=np.uint8) > 0
+        core_bool = np.asarray(core_mask, dtype=np.uint8) > 0
+        if not bool(face_bool.any()):
+            return {
+                "available": False,
+                "reason": "no-face-mask",
+                "alignment_method": alignment_method,
+            }
+
+        source_array = np.asarray(aligned_source.convert("RGB"), dtype=np.float32)
+        generated_array = np.asarray(generated_rgb, dtype=np.float32)
+        pixel_delta = np.abs(source_array - generated_array).mean(axis=2)
+        face_pixel_delta = float(pixel_delta[face_bool].mean() / 255.0)
+        core_pixel_delta = float(pixel_delta[core_bool].mean() / 255.0) if bool(core_bool.any()) else face_pixel_delta
+
+        highlight_mask = self._build_highlight_lock_mask(aligned_source, generated_rgb, face_mask)
+        highlight_bool = np.asarray(highlight_mask, dtype=np.uint8) > 0
+        if bool(highlight_bool.any()):
+            source_luminance = _luminance_array(source_array)
+            generated_luminance = _luminance_array(generated_array)
+            highlight_luminance_delta = float(
+                np.maximum(source_luminance - generated_luminance, 0.0)[highlight_bool].mean() / 255.0
+            )
+        else:
+            highlight_luminance_delta = 0.0
+
+        geometry_norm = float(np.clip(geometry_error / 0.055, 0.0, 1.0))
+        face_norm = float(np.clip(face_pixel_delta / 0.09, 0.0, 1.0))
+        core_norm = float(np.clip(core_pixel_delta / 0.07, 0.0, 1.0))
+        highlight_norm = float(np.clip(highlight_luminance_delta / 0.08, 0.0, 1.0))
+        score = float((0.34 * geometry_norm) + (0.26 * face_norm) + (0.28 * core_norm) + (0.12 * highlight_norm))
+
+        assessment: Dict[str, Any] = {
+            "available": True,
+            "score": round(score, 4),
+            "alignment_method": alignment_method,
+            "geometry_error": round(geometry_error, 4),
+            "face_pixel_delta": round(face_pixel_delta, 4),
+            "core_pixel_delta": round(core_pixel_delta, 4),
+            "highlight_luminance_delta": round(highlight_luminance_delta, 4),
+            "face_mask_coverage": round(float(face_bool.mean()), 4),
+        }
+        if parser_face is not None:
+            assessment["parser_score"] = parser_face.score
+        return assessment
+
     def _smart_protect(
         self,
         source_image: Image.Image,
@@ -885,17 +1181,18 @@ class FaceIdentityMasker:
     ) -> FaceMaskResult:
         normalized_mode = (mode or "balanced").strip().lower()
         generated_rgb = generated_image.convert("RGB")
+        base = max(generated_rgb.size)
 
-        source_landmarks = self._extract_landmarks(source_image)
+        aligned_source, source_landmarks, generated_landmarks, alignment_method = self._align_source_to_generated(
+            source_image,
+            generated_rgb,
+        )
         if not source_landmarks:
             return FaceMaskResult(image=generated_rgb, applied=False, mode=normalized_mode, reason="no-source-face", engine="smart")
 
-        generated_landmarks = self._extract_landmarks(generated_rgb)
         if not generated_landmarks:
             return FaceMaskResult(image=generated_rgb, applied=False, mode=normalized_mode, reason="no-output-face", engine="smart")
 
-        affine = _fit_affine(self._anchors(source_landmarks), self._anchors(generated_landmarks))
-        aligned_source = _warp_image(source_image, affine, generated_rgb.size)
         parser_face = self._parse_face_regions(generated_rgb)
         region_masks = self._build_smart_masks(generated_rgb.size, generated_landmarks, parser_face)
 
@@ -940,6 +1237,50 @@ class FaceIdentityMasker:
         apply_region(core_mask, profile["core"])
 
         final = np.clip(low_mix + detail_mix, 0, 255)
+        face_mask = _subtract_masks(
+            region_masks["face"],
+            region_masks["hairline"],
+            blur_radius=max(1.0, max(generated_rgb.size) / 360.0),
+        )
+        texture_mask = _union_masks(surface_mask, core_mask, remainder_mask)
+
+        if normalized_mode == "strict":
+            tone_lock_strength = 0.54 + (0.16 * float(np.clip(strength, 0.0, 1.0)))
+            texture_lock_strength = 0.48 + (0.18 * float(np.clip(strength, 0.0, 1.0)))
+        elif normalized_mode == "surface_fx":
+            tone_lock_strength = 0.18 + (0.12 * float(np.clip(strength, 0.0, 1.0)))
+            texture_lock_strength = 0.14 + (0.12 * float(np.clip(strength, 0.0, 1.0)))
+        else:
+            tone_lock_strength = 0.34 + (0.16 * float(np.clip(strength, 0.0, 1.0)))
+            texture_lock_strength = 0.28 + (0.18 * float(np.clip(strength, 0.0, 1.0)))
+
+        final, tone_lock_coverage = self._apply_face_tone_lock(
+            working_array=final,
+            source_array=source_array,
+            face_mask=face_mask,
+            radius=max(7.0, base / 90.0),
+            strength=tone_lock_strength,
+        )
+        final, texture_lock_coverage = self._apply_face_texture_lock(
+            working_array=final,
+            source_array=source_array,
+            face_mask=texture_mask,
+            radius=max(2.0, base / 230.0),
+            strength=texture_lock_strength,
+        )
+
+        highlight_lock_mask = self._build_highlight_lock_mask(aligned_source, generated_rgb, face_mask)
+        highlight_alpha = _mask_to_array(highlight_lock_mask)
+        if float(highlight_alpha.max()) > 0.0:
+            if normalized_mode == "surface_fx":
+                highlight_strength = 0.32 + (0.16 * float(np.clip(strength, 0.0, 1.0)))
+            elif normalized_mode == "strict":
+                highlight_strength = 0.58 + (0.18 * float(np.clip(strength, 0.0, 1.0)))
+            else:
+                highlight_strength = 0.44 + (0.18 * float(np.clip(strength, 0.0, 1.0)))
+            highlight_blend = (generated_array * (1.0 - highlight_strength)) + (source_array * highlight_strength)
+            final = (final * (1.0 - highlight_alpha)) + (highlight_blend * highlight_alpha)
+
         result_image = Image.fromarray(final.astype(np.uint8), mode="RGB")
         metadata: Dict[str, Any] = {
             "strategy_used": "smart",
@@ -947,6 +1288,10 @@ class FaceIdentityMasker:
             "strength": round(float(np.clip(strength, 0.0, 1.0)), 3),
             "parser_score": parser_face.score,
             "parser_rect": [round(value, 2) for value in parser_face.rect],
+            "alignment_method": alignment_method,
+            "highlight_lock_coverage": round(float((np.asarray(highlight_lock_mask, dtype=np.uint8) > 0).mean()), 4),
+            "tone_lock_coverage": round(tone_lock_coverage, 4),
+            "texture_lock_coverage": round(texture_lock_coverage, 4),
         }
 
         return FaceMaskResult(
@@ -1066,17 +1411,145 @@ class FaceIdentityMasker:
 
         source_array = np.asarray(aligned_source, dtype=np.float32)
         generated_array = np.asarray(generated_rgb, dtype=np.float32)
-        inner_alpha = _mask_to_array(inner_preserve_mask)
-        outer_alpha = _mask_to_array(preserve_mask) * (0.96 + (0.04 * float(np.clip(strength, 0.0, 1.0))))
-        alpha = np.clip(np.maximum(inner_alpha, outer_alpha), 0.0, 1.0)
+        detail_radius = max(4.0, base / 140.0)
+        source_low = np.asarray(aligned_source.filter(ImageFilter.GaussianBlur(radius=detail_radius)), dtype=np.float32)
+        generated_low = np.asarray(generated_rgb.filter(ImageFilter.GaussianBlur(radius=detail_radius)), dtype=np.float32)
+        source_detail = source_array - source_low
+        generated_detail = generated_array - generated_low
 
-        final = (generated_array * (1.0 - alpha)) + (source_array * alpha)
+        full_face_mask = preserve_mask
+        face_surface_mask = preserve_mask
+        face_core_mask = inner_preserve_mask
+        if region_masks is not None:
+            full_face_mask = _subtract_masks(
+                region_masks["face"],
+                region_masks["hairline"],
+                blur_radius=max(1.0, base / 360.0),
+            )
+            face_core_mask = _union_masks(face_core_mask, region_masks["core"])
+            face_surface_mask = _subtract_masks(
+                full_face_mask,
+                face_core_mask,
+                region_masks["contour"],
+                region_masks["hairline"],
+                blur_radius=max(1.2, base / 340.0),
+            )
+
+        low_mix = generated_low.copy()
+        detail_mix = generated_detail.copy()
+
+        def apply_region(mask: Image.Image, source_low_weight: float, generated_detail_weight: float, source_detail_weight: float) -> None:
+            nonlocal low_mix, detail_mix
+            alpha = _mask_to_array(mask)
+            if float(alpha.max()) <= 0.0:
+                return
+
+            region_low = (source_low * source_low_weight) + (generated_low * (1.0 - source_low_weight))
+            region_detail = (generated_detail * generated_detail_weight) + (source_detail * source_detail_weight)
+            low_mix = (low_mix * (1.0 - alpha)) + (region_low * alpha)
+            detail_mix = (detail_mix * (1.0 - alpha)) + (region_detail * alpha)
+
+        clamped_strength = float(np.clip(strength, 0.0, 1.0))
+        if normalized_mode == "strict":
+            full_face_source_low_weight = 0.975 + (0.02 * clamped_strength)
+            full_face_generated_detail_weight = 0.06 - (0.03 * clamped_strength)
+            full_face_source_detail_weight = 0.30 + (0.20 * clamped_strength)
+            face_surface_source_low_weight = 0.988 + (0.01 * clamped_strength)
+            face_surface_generated_detail_weight = 0.03 - (0.015 * clamped_strength)
+            face_surface_source_detail_weight = 0.52 + (0.18 * clamped_strength)
+            face_core_source_low_weight = 0.994 + (0.005 * clamped_strength)
+            face_core_generated_detail_weight = 0.015 - (0.008 * clamped_strength)
+            face_core_source_detail_weight = 0.82 + (0.12 * clamped_strength)
+            full_face_lock_strength = 0.60 + (0.18 * clamped_strength)
+            tone_lock_strength = 0.78 + (0.14 * clamped_strength)
+            texture_lock_strength = 0.66 + (0.16 * clamped_strength)
+        elif normalized_mode == "surface_fx":
+            full_face_source_low_weight = 0.95 + (0.03 * clamped_strength)
+            full_face_generated_detail_weight = 0.12 - (0.05 * clamped_strength)
+            full_face_source_detail_weight = 0.22 + (0.18 * clamped_strength)
+            face_surface_source_low_weight = 0.978 + (0.012 * clamped_strength)
+            face_surface_generated_detail_weight = 0.05 - (0.02 * clamped_strength)
+            face_surface_source_detail_weight = 0.40 + (0.18 * clamped_strength)
+            face_core_source_low_weight = 0.99 + (0.008 * clamped_strength)
+            face_core_generated_detail_weight = 0.025 - (0.01 * clamped_strength)
+            face_core_source_detail_weight = 0.76 + (0.14 * clamped_strength)
+            full_face_lock_strength = 0.44 + (0.14 * clamped_strength)
+            tone_lock_strength = 0.56 + (0.14 * clamped_strength)
+            texture_lock_strength = 0.44 + (0.16 * clamped_strength)
+        else:
+            full_face_source_low_weight = 0.965 + (0.025 * clamped_strength)
+            full_face_generated_detail_weight = 0.09 - (0.04 * clamped_strength)
+            full_face_source_detail_weight = 0.26 + (0.18 * clamped_strength)
+            face_surface_source_low_weight = 0.983 + (0.012 * clamped_strength)
+            face_surface_generated_detail_weight = 0.04 - (0.018 * clamped_strength)
+            face_surface_source_detail_weight = 0.46 + (0.18 * clamped_strength)
+            face_core_source_low_weight = 0.992 + (0.006 * clamped_strength)
+            face_core_generated_detail_weight = 0.02 - (0.01 * clamped_strength)
+            face_core_source_detail_weight = 0.78 + (0.14 * clamped_strength)
+            full_face_lock_strength = 0.52 + (0.16 * clamped_strength)
+            tone_lock_strength = 0.66 + (0.14 * clamped_strength)
+            texture_lock_strength = 0.54 + (0.16 * clamped_strength)
+
+        apply_region(
+            full_face_mask,
+            source_low_weight=full_face_source_low_weight,
+            generated_detail_weight=full_face_generated_detail_weight,
+            source_detail_weight=full_face_source_detail_weight,
+        )
+        apply_region(
+            face_surface_mask,
+            source_low_weight=face_surface_source_low_weight,
+            generated_detail_weight=face_surface_generated_detail_weight,
+            source_detail_weight=face_surface_source_detail_weight,
+        )
+        apply_region(
+            face_core_mask,
+            source_low_weight=face_core_source_low_weight,
+            generated_detail_weight=face_core_generated_detail_weight,
+            source_detail_weight=face_core_source_detail_weight,
+        )
+
+        final = np.clip(low_mix + detail_mix, 0, 255)
+        outer_alpha = _mask_to_array(preserve_mask) * (0.94 + (0.06 * clamped_strength))
+        inner_alpha = _mask_to_array(inner_preserve_mask)
+        final = (final * (1.0 - outer_alpha)) + (source_array * outer_alpha)
+        final = (final * (1.0 - inner_alpha)) + (source_array * inner_alpha)
+
+        full_face_alpha = _mask_to_array(full_face_mask) * full_face_lock_strength
+        source_dominant_face = (source_array * 0.992) + (generated_array * 0.008)
+        final = (final * (1.0 - full_face_alpha)) + (source_dominant_face * full_face_alpha)
+
+        texture_mask = _union_masks(face_surface_mask, face_core_mask)
+        final, tone_lock_coverage = self._apply_face_tone_lock(
+            working_array=final,
+            source_array=source_array,
+            face_mask=full_face_mask,
+            radius=max(7.0, base / 88.0),
+            strength=tone_lock_strength,
+        )
+        final, texture_lock_coverage = self._apply_face_texture_lock(
+            working_array=final,
+            source_array=source_array,
+            face_mask=texture_mask,
+            radius=max(1.8, base / 240.0),
+            strength=texture_lock_strength,
+        )
+
+        highlight_lock_mask = self._build_highlight_lock_mask(aligned_source, generated_rgb, full_face_mask)
+        highlight_alpha = _mask_to_array(highlight_lock_mask) * (0.88 + (0.10 * clamped_strength))
+        if float(highlight_alpha.max()) > 0.0:
+            highlight_blend = (source_array * 0.98) + (generated_array * 0.02)
+            final = (final * (1.0 - highlight_alpha)) + (highlight_blend * highlight_alpha)
+
         metadata: Dict[str, Any] = {
             "strategy_used": "preserve_skin",
             "motion_relaxed": False,
             "alignment_method": alignment_method,
-            "strength": round(float(np.clip(strength, 0.0, 1.0)), 3),
+            "strength": round(clamped_strength, 3),
             "preserved_skin_coverage": round(float((source_skin_mask_array > 0).mean()), 4),
+            "highlight_lock_coverage": round(float((np.asarray(highlight_lock_mask, dtype=np.uint8) > 0).mean()), 4),
+            "tone_lock_coverage": round(tone_lock_coverage, 4),
+            "texture_lock_coverage": round(texture_lock_coverage, 4),
         }
         if parser_error:
             metadata["parser_fallback"] = parser_error

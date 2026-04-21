@@ -144,7 +144,7 @@ The client lets you:
 - keep `Lock Face Identity` enabled to preserve the source face during edits
 - choose `Mask Strategy`:
 - `smart` uses parsing-aware masks, region-aware blending, adaptive sizing, and surface-safe editing
-- `preserve_skin` keeps already-visible source skin as close to the original photo as possible and automatically relaxes if the prompt asks for pose or framing changes
+- `preserve_skin` keeps already-visible source skin as close to the original photo as possible, uses conservative face alignment, applies a source-dominant full-face composite, and automatically relaxes if the prompt asks for pose or framing changes
 - `auto` uses the smart path but falls back to the old landmark-only behavior if the parser path is unavailable
 - `legacy` forces the previous landmark-only behavior
 - choose `Face Mask Mode`:
@@ -161,7 +161,7 @@ The client lets you:
 - optionally set `Width` and `Height` manually if you want a custom native resolution
 - submit the job to Runpod
 - preview the returned image
-- inspect the mask engine, quality mode, face coverage, native generated size, and final delivered size in the status box
+- inspect the mask engine, quality mode, face coverage, identity drift score, native generated size, and final delivered size in the status box
 - receive outputs that are automatically upscaled to at least 1920 on the long edge, 1080 on the short edge, and 2,073,600 total pixels
 - inspect the raw JSON response and returned debug masks
 
@@ -247,6 +247,11 @@ FACE_MASK_STRATEGY=smart
 FACE_MASK_MODE=surface_fx
 FACE_MASK_STRENGTH=0.86
 FACE_MASK_DEBUG=false
+IDENTITY_DRIFT_AUTO_RETRY=true
+IDENTITY_DRIFT_THRESHOLD=0.26
+IDENTITY_RETRY_GUIDANCE_BOOST=0.28
+IDENTITY_RETRY_STEP_BOOST=2
+IDENTITY_RETRY_MASK_STRENGTH_BOOST=0.14
 QUALITY_MODE=balanced
 ADAPTIVE_GENERATION=true
 MIN_NATIVE_LONG_EDGE=1536
@@ -272,7 +277,10 @@ Optional:
 - `HF_INFERENCE_API_KEY`: only needed if you want `rewrite_prompt=true`.
 - `BUCKET_ENDPOINT_URL`, `BUCKET_ACCESS_KEY_ID`, `BUCKET_SECRET_ACCESS_KEY`: if these are present and `RUNPOD_ENABLE_BUCKET_UPLOADS` is left empty, the worker auto-switches to uploaded URLs.
 - `FACE_MASK_STRATEGY=legacy`: forces the previous landmark-only masking behavior if you want a runtime fallback without changing branches.
-- `FACE_MASK_STRATEGY=preserve_skin`: preserves already-exposed source skin more strictly and relaxes automatically when the prompt requests body movement or reframing.
+- `FACE_MASK_STRATEGY=preserve_skin`: preserves already-exposed source skin more strictly, uses a stronger full-face source composite, restores more original face tone and texture, and relaxes automatically when the prompt requests body movement or reframing.
+- `IDENTITY_DRIFT_AUTO_RETRY=true`: runs one extra generation pass only when the finished face still drifts too far from the source after masking.
+- `IDENTITY_DRIFT_THRESHOLD`: lower this if you want the retry to trigger more aggressively.
+- `IDENTITY_RETRY_GUIDANCE_BOOST`, `IDENTITY_RETRY_STEP_BOOST`, `IDENTITY_RETRY_MASK_STRENGTH_BOOST`: tune how hard the retry leans toward preserving the original face.
 
 You can copy these from `.env.runpod.example`.
 

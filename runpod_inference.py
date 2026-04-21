@@ -34,6 +34,10 @@ DEFAULT_QUALITY_MODE = "balanced"
 DEFAULT_POSTPROCESS_UPSCALE_MODE = "detail"
 DEFAULT_FACE_MASK_STRATEGY = "smart"
 DEFAULT_FACE_MASK_STRENGTH = 0.86
+DEFAULT_IDENTITY_DRIFT_THRESHOLD = 0.26
+DEFAULT_IDENTITY_RETRY_GUIDANCE_BOOST = 0.28
+DEFAULT_IDENTITY_RETRY_STEP_BOOST = 2
+DEFAULT_IDENTITY_RETRY_MASK_STRENGTH_BOOST = 0.14
 
 SYSTEM_PROMPT = """
 # Edit Instruction Rewriter
@@ -714,6 +718,29 @@ class WorkerConfig:
         1.0,
     )
     face_mask_debug: bool = _to_bool(os.environ.get("FACE_MASK_DEBUG"), False)
+    identity_drift_auto_retry: bool = _to_bool(os.environ.get("IDENTITY_DRIFT_AUTO_RETRY"), True)
+    identity_drift_threshold: float = _clamp_float(
+        _to_float(os.environ.get("IDENTITY_DRIFT_THRESHOLD"), DEFAULT_IDENTITY_DRIFT_THRESHOLD),
+        0.0,
+        1.0,
+    )
+    identity_retry_guidance_boost: float = _clamp_float(
+        _to_float(os.environ.get("IDENTITY_RETRY_GUIDANCE_BOOST"), DEFAULT_IDENTITY_RETRY_GUIDANCE_BOOST),
+        0.0,
+        1.0,
+    )
+    identity_retry_step_boost: int = _to_int(
+        os.environ.get("IDENTITY_RETRY_STEP_BOOST"),
+        DEFAULT_IDENTITY_RETRY_STEP_BOOST,
+    )
+    identity_retry_mask_strength_boost: float = _clamp_float(
+        _to_float(
+            os.environ.get("IDENTITY_RETRY_MASK_STRENGTH_BOOST"),
+            DEFAULT_IDENTITY_RETRY_MASK_STRENGTH_BOOST,
+        ),
+        0.0,
+        0.35,
+    )
     quality_mode: str = _normalize_quality_mode(os.environ.get("QUALITY_MODE", DEFAULT_QUALITY_MODE))
     adaptive_generation: bool = _to_bool(os.environ.get("ADAPTIVE_GENERATION"), True)
     minimum_native_long_edge: int = _to_int(
@@ -989,6 +1016,49 @@ class QwenRunpodService:
         except Exception as exc:
             print(f"[mask] face coverage estimation failed: {exc}")
             return None
+
+    def _assess_identity_drift(
+        self,
+        source_image: Image.Image,
+        generated_images: Sequence[Image.Image],
+    ) -> List[Dict[str, Any]]:
+        masker = self._get_face_masker()
+        if masker is False:
+            return [{"available": False, "reason": "masker-unavailable"} for _ in generated_images]
+
+        assessments: List[Dict[str, Any]] = []
+        for image in generated_images:
+            try:
+                assessments.append(masker.assess_identity_drift(source_image, image))
+            except Exception as exc:
+                assessments.append({"available": False, "reason": f"assessment-failed:{exc}"})
+        return assessments
+
+    @staticmethod
+    def _identity_drift_score(assessment: Dict[str, Any] | None) -> float | None:
+        if not assessment or not assessment.get("available"):
+            return None
+        score = assessment.get("score")
+        if score is None:
+            return None
+        return float(score)
+
+    @classmethod
+    def _should_select_identity_retry(
+        cls,
+        original_assessment: Dict[str, Any] | None,
+        retry_assessment: Dict[str, Any] | None,
+        threshold: float,
+    ) -> bool:
+        retry_score = cls._identity_drift_score(retry_assessment)
+        if retry_score is None:
+            return False
+
+        original_score = cls._identity_drift_score(original_assessment)
+        if original_score is None:
+            return True
+
+        return retry_score <= (threshold - 0.01) or retry_score <= (original_score - 0.015)
 
     def _generate_with_retries(
         self,
@@ -1364,6 +1434,115 @@ class QwenRunpodService:
             ]
             debug_mask_payloads = [{} for _ in output_images]
 
+        identity_drift = (
+            self._assess_identity_drift(images[0], output_images)
+            if images
+            else [{"available": False, "reason": "no-source-image"} for _ in output_images]
+        )
+        identity_retry: Dict[str, Any] = {
+            "enabled": self.config.identity_drift_auto_retry,
+            "attempted": False,
+            "used": False,
+            "threshold": self.config.identity_drift_threshold,
+            "selected_indices": [],
+        }
+        retry_selected_indices: set[int] = set()
+
+        if (
+            images
+            and output_images
+            and self.config.identity_drift_auto_retry
+            and enforce_identity_lock
+            and face_mask_mode != "off"
+        ):
+            retry_trigger_indices = [
+                index
+                for index, assessment in enumerate(identity_drift)
+                if (self._identity_drift_score(assessment) or -1.0) >= self.config.identity_drift_threshold
+            ]
+            if retry_trigger_indices:
+                retry_guidance_scale = _ensure_effective_true_cfg_scale(
+                    requested_scale=max(
+                        true_guidance_scale + self.config.identity_retry_guidance_boost,
+                        self.config.minimum_identity_true_guidance_scale,
+                    ),
+                    enforce_identity_lock=enforce_identity_lock,
+                    face_mask_mode=face_mask_mode,
+                    minimum_identity_scale=self.config.minimum_identity_true_guidance_scale,
+                )
+                retry_num_inference_steps = min(12, num_inference_steps + max(0, self.config.identity_retry_step_boost))
+                retry_mask_strength = _clamp_float(
+                    face_mask_strength + self.config.identity_retry_mask_strength_boost,
+                    0.0,
+                    1.0,
+                )
+                identity_retry.update(
+                    {
+                        "attempted": True,
+                        "triggered_indices": retry_trigger_indices,
+                        "retry_true_guidance_scale": retry_guidance_scale,
+                        "retry_num_inference_steps": retry_num_inference_steps,
+                        "retry_mask_strength": retry_mask_strength,
+                    }
+                )
+                print(
+                    f"[identity] drift detected on indices={retry_trigger_indices}; retrying with "
+                    f"steps={retry_num_inference_steps}, true_cfg_scale={retry_guidance_scale}, "
+                    f"mask_strength={round(retry_mask_strength, 3)}"
+                )
+
+                with torch.inference_mode():
+                    retry_output, retry_generation_attempts, retry_width, retry_height, retry_num_inference_steps = (
+                        self._generate_with_retries(
+                            images=images,
+                            prompt=resolved_prompt,
+                            negative_prompt=negative_prompt,
+                            seed=seed,
+                            width=width,
+                            height=height,
+                            num_inference_steps=retry_num_inference_steps,
+                            true_guidance_scale=retry_guidance_scale,
+                            num_images_per_prompt=num_images_per_prompt,
+                        )
+                    )
+
+                retry_output_images = list(retry_output.images)
+                retry_output_images, retry_face_masking, retry_debug_payloads = self._apply_face_masking(
+                    source_image=images[0],
+                    generated_images=retry_output_images,
+                    prompt=resolved_prompt,
+                    mode=face_mask_mode,
+                    strategy=face_mask_strategy,
+                    strength=retry_mask_strength,
+                    debug_masks=debug_masks,
+                )
+                retry_identity_drift = self._assess_identity_drift(images[0], retry_output_images)
+                identity_retry["retry_generation_attempts"] = retry_generation_attempts
+                identity_retry["retry_width"] = retry_width
+                identity_retry["retry_height"] = retry_height
+
+                for index in range(min(len(output_images), len(retry_output_images))):
+                    if self._should_select_identity_retry(
+                        original_assessment=identity_drift[index],
+                        retry_assessment=retry_identity_drift[index],
+                        threshold=self.config.identity_drift_threshold,
+                    ):
+                        output_images[index] = retry_output_images[index]
+                        face_masking[index] = retry_face_masking[index]
+                        debug_mask_payloads[index] = retry_debug_payloads[index]
+                        identity_drift[index] = retry_identity_drift[index]
+                        retry_selected_indices.add(index)
+
+                identity_retry["used"] = bool(retry_selected_indices)
+                identity_retry["selected_indices"] = sorted(retry_selected_indices)
+
+        for index, metadata in enumerate(face_masking):
+            metadata["identity_drift"] = identity_drift[index] if index < len(identity_drift) else {
+                "available": False,
+                "reason": "missing-assessment",
+            }
+            metadata["identity_retry_selected"] = index in retry_selected_indices if identity_retry["attempted"] else False
+
         image_payloads = self._serialize_output(
             job_id=job_id,
             images=output_images,
@@ -1415,6 +1594,7 @@ class QwenRunpodService:
                 "prompt_intent": prompt_intent,
                 "face_coverage": round(face_coverage, 4) if face_coverage is not None else None,
                 "attempts": generation_attempts,
+                "identity_retry": identity_retry,
             },
             "timings": {
                 "worker_load_seconds": self._load_seconds,
