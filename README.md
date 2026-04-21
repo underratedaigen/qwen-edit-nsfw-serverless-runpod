@@ -144,6 +144,7 @@ The client lets you:
 - keep `Lock Face Identity` enabled to preserve the source face during edits
 - choose `Mask Strategy`:
 - `smart` uses parsing-aware masks, region-aware blending, adaptive sizing, and surface-safe editing
+- `preserve_skin` keeps already-visible source skin as close to the original photo as possible and automatically relaxes if the prompt asks for pose or framing changes
 - `auto` uses the smart path but falls back to the old landmark-only behavior if the parser path is unavailable
 - `legacy` forces the previous landmark-only behavior
 - choose `Face Mask Mode`:
@@ -271,6 +272,7 @@ Optional:
 - `HF_INFERENCE_API_KEY`: only needed if you want `rewrite_prompt=true`.
 - `BUCKET_ENDPOINT_URL`, `BUCKET_ACCESS_KEY_ID`, `BUCKET_SECRET_ACCESS_KEY`: if these are present and `RUNPOD_ENABLE_BUCKET_UPLOADS` is left empty, the worker auto-switches to uploaded URLs.
 - `FACE_MASK_STRATEGY=legacy`: forces the previous landmark-only masking behavior if you want a runtime fallback without changing branches.
+- `FACE_MASK_STRATEGY=preserve_skin`: preserves already-exposed source skin more strictly and relaxes automatically when the prompt requests body movement or reframing.
 
 You can copy these from `.env.runpod.example`.
 

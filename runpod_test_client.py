@@ -268,8 +268,8 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
     gr.Markdown("# Runpod Qwen Image Test Client")
     gr.Markdown(
         "Upload one image, enter a prompt, and test your Runpod endpoint. "
-        "The worker now supports smart parsing-based masking, adaptive quality planning, debug masks, "
-        "and a legacy fallback path."
+        "The worker now supports smart parsing-based masking, exposed-skin preservation, adaptive quality planning, "
+        "debug masks, and a legacy fallback path."
     )
 
     with gr.Row():
@@ -298,7 +298,7 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
         with gr.Row():
             rewrite_prompt = gr.Checkbox(label="Rewrite Prompt", value=False)
             lock_face_identity = gr.Checkbox(label="Lock Face Identity", value=True)
-            face_mask_strategy = gr.Dropdown(label="Mask Strategy", choices=["smart", "auto", "legacy"], value="smart")
+            face_mask_strategy = gr.Dropdown(label="Mask Strategy", choices=["smart", "preserve_skin", "auto", "legacy"], value="smart")
             face_mask_mode = gr.Dropdown(label="Face Mask Mode", choices=["surface_fx", "balanced", "strict", "off"], value="surface_fx")
             face_mask_strength = gr.Slider(label="Mask Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.86)
             debug_masks = gr.Checkbox(label="Debug Masks", value=False)

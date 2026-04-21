@@ -268,7 +268,7 @@ def _normalize_quality_mode(value: Any) -> str:
 
 
 def _normalize_mask_strategy(value: Any) -> str:
-    return _normalize_choice(value, {"auto", "smart", "legacy"}, DEFAULT_FACE_MASK_STRATEGY)
+    return _normalize_choice(value, {"auto", "smart", "legacy", "preserve_skin"}, DEFAULT_FACE_MASK_STRATEGY)
 
 
 def _normalize_mask_mode(value: Any) -> str:
@@ -1019,6 +1019,7 @@ class QwenRunpodService:
         self,
         source_image: Image.Image,
         generated_images: Sequence[Image.Image],
+        prompt: str,
         mode: str,
         strategy: str,
         strength: float,
@@ -1047,6 +1048,7 @@ class QwenRunpodService:
                 mode=normalized_mode,
                 strategy=strategy,
                 strength=strength,
+                prompt=prompt,
                 debug=debug_masks,
             )
             protected_images.append(result.image)
@@ -1286,6 +1288,7 @@ class QwenRunpodService:
             output_images, face_masking, debug_mask_payloads = self._apply_face_masking(
                 source_image=images[0],
                 generated_images=output_images,
+                prompt=resolved_prompt,
                 mode=face_mask_mode,
                 strategy=face_mask_strategy,
                 strength=face_mask_strength,

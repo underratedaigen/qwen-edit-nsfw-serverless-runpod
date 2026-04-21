@@ -62,6 +62,94 @@ PARSER_LABEL_COLORS = {
     "hair": (255, 0, 0),
 }
 
+POSITION_CHANGE_HINTS = (
+    "different pose",
+    "new pose",
+    "change pose",
+    "reposition",
+    "change position",
+    "different position",
+    "turn around",
+    "turn sideways",
+    "side profile",
+    "profile view",
+    "back view",
+    "facing away",
+    "look away",
+    "walk",
+    "walking",
+    "run",
+    "running",
+    "jump",
+    "jumping",
+    "dance",
+    "dancing",
+    "sit down",
+    "sitting",
+    "stand up",
+    "standing",
+    "kneeling",
+    "crouching",
+    "lying down",
+    "laying down",
+    "lean back",
+    "lean forward",
+    "raise arm",
+    "raise arms",
+    "lift arm",
+    "lift arms",
+    "hands up",
+    "arms up",
+    "move closer",
+    "move farther",
+    "closer to camera",
+    "farther from camera",
+    "full body",
+    "wide shot",
+    "medium shot",
+    "close-up",
+    "close up",
+)
+
+POSITION_CHANGE_VERBS = (
+    "raise",
+    "lift",
+    "move",
+    "turn",
+    "rotate",
+    "bend",
+    "lean",
+    "sit",
+    "stand",
+    "kneel",
+    "crouch",
+    "lie",
+    "lay",
+    "walk",
+    "run",
+    "jump",
+    "dance",
+    "step",
+)
+
+POSITION_CHANGE_TARGETS = (
+    "arm",
+    "arms",
+    "hand",
+    "hands",
+    "leg",
+    "legs",
+    "body",
+    "torso",
+    "hip",
+    "hips",
+    "shoulder",
+    "shoulders",
+    "head",
+    "pose",
+    "position",
+)
+
 
 def _connection_ids(connections: Iterable[tuple[int, int]]) -> list[int]:
     ids: set[int] = set()
@@ -221,6 +309,81 @@ def _overlay_regions(base_image: Image.Image, regions: Dict[str, Image.Image]) -
     return Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8), mode="RGB")
 
 
+def _normalize_prompt(prompt: str | None) -> str:
+    return " ".join(str(prompt or "").lower().split())
+
+
+def _position_change_hints(prompt: str | None) -> list[str]:
+    normalized = _normalize_prompt(prompt)
+    if not normalized:
+        return []
+
+    matches: list[str] = []
+    for term in POSITION_CHANGE_HINTS:
+        if term in normalized:
+            matches.append(term)
+
+    if any(term in normalized for term in POSITION_CHANGE_VERBS) and any(
+        term in normalized for term in POSITION_CHANGE_TARGETS
+    ):
+        matches.append("body-motion")
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for match in matches:
+        if match not in seen:
+            seen.add(match)
+            ordered.append(match)
+    return ordered
+
+
+def _detect_exposed_skin_mask(image: Image.Image) -> Image.Image:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    hsv = np.asarray(image.convert("HSV"), dtype=np.uint8)
+
+    r = rgb[..., 0].astype(np.float32)
+    g = rgb[..., 1].astype(np.float32)
+    b = rgb[..., 2].astype(np.float32)
+    h = hsv[..., 0].astype(np.float32) * (360.0 / 255.0)
+    s = hsv[..., 1].astype(np.float32) / 255.0
+    v = hsv[..., 2].astype(np.float32) / 255.0
+
+    max_channel = np.maximum(np.maximum(r, g), b)
+    min_channel = np.minimum(np.minimum(r, g), b)
+    cb = 128.0 - (0.168736 * r) - (0.331264 * g) + (0.5 * b)
+    cr = 128.0 + (0.5 * r) - (0.418688 * g) - (0.081312 * b)
+    luminance = (0.299 * r) + (0.587 * g) + (0.114 * b)
+
+    rgb_rule = (
+        (r > 45)
+        & (g > 25)
+        & (b > 10)
+        & ((max_channel - min_channel) > 15)
+        & (np.abs(r - g) > 10)
+        & (r > g)
+        & (r > b)
+    )
+    ycrcb_rule = (cr >= 132) & (cr <= 178) & (cb >= 82) & (cb <= 135)
+    hsv_rule = (((h <= 45) | (h >= 335)) & (s >= 0.08) & (s <= 0.72) & (v >= 0.18))
+    near_white = (r > 238) & (g > 232) & (b > 226) & (np.abs(r - g) < 10) & (np.abs(r - b) < 18)
+
+    mask = ((rgb_rule & hsv_rule) | (ycrcb_rule & hsv_rule)) & (luminance > 30) & ~near_white
+    pil_mask = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
+
+    base = max(image.size)
+    pil_mask = _contract_mask(
+        pil_mask,
+        contract_px=max(1, int(base / 520)),
+        blur_radius=max(1.0, base / 560.0),
+    )
+    pil_mask = _expand_mask(
+        pil_mask,
+        expand_px=max(1, int(base / 420)),
+        blur_radius=max(1.5, base / 360.0),
+    )
+    return pil_mask
+
+
 @dataclass
 class FaceMaskResult:
     image: Image.Image
@@ -298,6 +461,35 @@ class FaceIdentityMasker:
         self._parser_model = parser_model
         self._parser_runtime: _FacerParserRuntime | None = None
         self._parser_failed = False
+
+    def _align_source_to_generated(
+        self,
+        source_image: Image.Image,
+        generated_image: Image.Image,
+    ) -> tuple[Image.Image, list[tuple[float, float]] | None, list[tuple[float, float]] | None, str]:
+        source_rgb = source_image.convert("RGB")
+        generated_rgb = generated_image.convert("RGB")
+        source_landmarks = self._extract_landmarks(source_rgb)
+        generated_landmarks = self._extract_landmarks(generated_rgb)
+
+        if source_landmarks and generated_landmarks:
+            affine = _fit_affine(self._anchors(source_landmarks), self._anchors(generated_landmarks))
+            return (
+                _warp_image(source_rgb, affine, generated_rgb.size),
+                source_landmarks,
+                generated_landmarks,
+                "face_affine",
+            )
+
+        if source_rgb.size != generated_rgb.size:
+            return (
+                source_rgb.resize(generated_rgb.size, resample=Image.Resampling.BICUBIC),
+                source_landmarks,
+                generated_landmarks,
+                "resized",
+            )
+
+        return source_rgb, source_landmarks, generated_landmarks, "direct"
 
     def _extract_landmarks(self, image: Image.Image) -> list[tuple[float, float]] | None:
         rgb = np.asarray(image.convert("RGB"))
@@ -655,6 +847,34 @@ class FaceIdentityMasker:
             "overlay_regions": _overlay_regions(generated_image, overlay_regions),
         }
 
+    def _build_preserve_skin_debug_images(
+        self,
+        generated_image: Image.Image,
+        aligned_source: Image.Image,
+        source_skin_mask: Image.Image,
+        preserve_mask: Image.Image,
+        inner_preserve_mask: Image.Image,
+        region_masks: Dict[str, Image.Image] | None,
+    ) -> Dict[str, Image.Image]:
+        overlay_regions = {
+            "surface": preserve_mask,
+            "core": inner_preserve_mask,
+        }
+        if region_masks is not None:
+            overlay_regions["face"] = region_masks["face"]
+            overlay_regions["hairline"] = region_masks["hairline"]
+
+        debug_images = {
+            "source_aligned": aligned_source,
+            "mask_source_skin": source_skin_mask.convert("L"),
+            "mask_preserve_outer": preserve_mask.convert("L"),
+            "mask_preserve_inner": inner_preserve_mask.convert("L"),
+            "overlay_regions": _overlay_regions(generated_image, overlay_regions),
+        }
+        if region_masks is not None:
+            debug_images["parser_labels"] = region_masks["parser_labels"]
+        return debug_images
+
     def _smart_protect(
         self,
         source_image: Image.Image,
@@ -739,6 +959,149 @@ class FaceIdentityMasker:
             debug_images=self._build_smart_debug_images(generated_rgb, aligned_source, region_masks) if debug else {},
         )
 
+    def _preserve_skin_protect(
+        self,
+        source_image: Image.Image,
+        generated_image: Image.Image,
+        mode: str,
+        strength: float,
+        prompt: str | None,
+        debug: bool,
+    ) -> FaceMaskResult:
+        normalized_mode = (mode or "balanced").strip().lower()
+        motion_hints = _position_change_hints(prompt)
+
+        if motion_hints:
+            try:
+                relaxed = self._smart_protect(
+                    source_image=source_image,
+                    generated_image=generated_image,
+                    mode=normalized_mode,
+                    strength=strength,
+                    debug=debug,
+                )
+            except Exception:
+                relaxed = self._legacy_protect(
+                    source_image=source_image,
+                    generated_image=generated_image,
+                    mode=normalized_mode,
+                    debug=debug,
+                )
+
+            relaxed.engine = "preserve_skin"
+            relaxed.reason = f"{relaxed.reason}; preserve-skin-relaxed-for-motion"
+            relaxed.metadata["strategy_used"] = "preserve_skin"
+            relaxed.metadata["motion_relaxed"] = True
+            relaxed.metadata["motion_hints"] = motion_hints
+            return relaxed
+
+        generated_rgb = generated_image.convert("RGB")
+        aligned_source, _, generated_landmarks, alignment_method = self._align_source_to_generated(
+            source_image,
+            generated_rgb,
+        )
+        source_skin_mask = _detect_exposed_skin_mask(aligned_source)
+        source_skin_mask_array = np.asarray(source_skin_mask, dtype=np.uint8)
+
+        if int(source_skin_mask_array.max()) <= 0:
+            try:
+                fallback = self._smart_protect(
+                    source_image=source_image,
+                    generated_image=generated_image,
+                    mode=normalized_mode,
+                    strength=strength,
+                    debug=debug,
+                )
+            except Exception:
+                fallback = self._legacy_protect(
+                    source_image=source_image,
+                    generated_image=generated_image,
+                    mode=normalized_mode,
+                    debug=debug,
+                )
+
+            fallback.engine = "preserve_skin"
+            fallback.reason = f"{fallback.reason}; preserve-skin-fallback-no-source-skin"
+            fallback.metadata["strategy_used"] = "preserve_skin"
+            fallback.metadata["motion_relaxed"] = False
+            fallback.metadata["alignment_method"] = alignment_method
+            return fallback
+
+        base = max(generated_rgb.size)
+        preserve_mask = _expand_mask(
+            source_skin_mask,
+            expand_px=max(1, int(base / 420)),
+            blur_radius=max(2.0, base / 320.0),
+        )
+        inner_preserve_mask = _contract_mask(
+            source_skin_mask,
+            contract_px=max(1, int(base / 420)),
+            blur_radius=max(1.2, base / 420.0),
+        )
+
+        region_masks: Dict[str, Image.Image] | None = None
+        parser_error: str | None = None
+        if generated_landmarks:
+            try:
+                parser_face = self._parse_face_regions(generated_rgb)
+                region_masks = self._build_smart_masks(generated_rgb.size, generated_landmarks, parser_face)
+                face_skin_mask = _subtract_masks(
+                    _union_masks(
+                        region_masks["surface"],
+                        region_masks["remainder"],
+                        region_masks["core"],
+                    ),
+                    region_masks["hairline"],
+                    blur_radius=max(1.2, base / 340.0),
+                )
+                preserve_mask = _union_masks(preserve_mask, face_skin_mask)
+                inner_preserve_mask = _union_masks(inner_preserve_mask, region_masks["core"])
+                preserve_mask = _subtract_masks(
+                    preserve_mask,
+                    region_masks["hairline"],
+                    blur_radius=max(1.0, base / 360.0),
+                )
+            except Exception as exc:
+                parser_error = str(exc)
+
+        source_array = np.asarray(aligned_source, dtype=np.float32)
+        generated_array = np.asarray(generated_rgb, dtype=np.float32)
+        inner_alpha = _mask_to_array(inner_preserve_mask)
+        outer_alpha = _mask_to_array(preserve_mask) * (0.96 + (0.04 * float(np.clip(strength, 0.0, 1.0))))
+        alpha = np.clip(np.maximum(inner_alpha, outer_alpha), 0.0, 1.0)
+
+        final = (generated_array * (1.0 - alpha)) + (source_array * alpha)
+        metadata: Dict[str, Any] = {
+            "strategy_used": "preserve_skin",
+            "motion_relaxed": False,
+            "alignment_method": alignment_method,
+            "strength": round(float(np.clip(strength, 0.0, 1.0)), 3),
+            "preserved_skin_coverage": round(float((source_skin_mask_array > 0).mean()), 4),
+        }
+        if parser_error:
+            metadata["parser_fallback"] = parser_error
+
+        return FaceMaskResult(
+            image=Image.fromarray(np.clip(final, 0, 255).astype(np.uint8), mode="RGB"),
+            applied=True,
+            mode=normalized_mode,
+            reason="preserve-skin-source-composite",
+            engine="preserve_skin",
+            metadata=metadata,
+            debug_images=(
+                self._build_preserve_skin_debug_images(
+                    generated_rgb,
+                    aligned_source,
+                    source_skin_mask,
+                    preserve_mask,
+                    inner_preserve_mask,
+                    region_masks,
+                )
+                if debug
+                else {}
+            ),
+        )
+
     def protect(
         self,
         source_image: Image.Image,
@@ -746,6 +1109,7 @@ class FaceIdentityMasker:
         mode: str = "balanced",
         strategy: str = "auto",
         strength: float = 0.86,
+        prompt: str | None = None,
         debug: bool = False,
     ) -> FaceMaskResult:
         normalized_mode = (mode or "balanced").strip().lower()
@@ -757,6 +1121,18 @@ class FaceIdentityMasker:
         if normalized_strategy == "legacy":
             result = self._legacy_protect(source_image, generated_image, mode=normalized_mode, debug=debug)
             result.metadata.setdefault("strategy_requested", "legacy")
+            return result
+
+        if normalized_strategy == "preserve_skin":
+            result = self._preserve_skin_protect(
+                source_image=source_image,
+                generated_image=generated_image,
+                mode=normalized_mode,
+                strength=strength,
+                prompt=prompt,
+                debug=debug,
+            )
+            result.metadata.setdefault("strategy_requested", "preserve_skin")
             return result
 
         try:
