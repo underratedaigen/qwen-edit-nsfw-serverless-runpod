@@ -157,7 +157,7 @@ The client lets you:
 - choose `Quality Mode` to trade speed vs image quality
 - optionally enable `Debug Masks` to return parser labels, region masks, and overlays for the first output image
 - choose `Upscale Mode` for the final postprocess stage after masking
-- leave `Width` and `Height` blank to use the higher-quality automatic native render size
+- leave `Width` and `Height` blank to match the source image size automatically
 - optionally set `Width` and `Height` manually if you want a custom native resolution
 - submit the job to Runpod
 - preview the returned image

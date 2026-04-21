@@ -243,12 +243,18 @@ def run_inference(
             if first_image
             else "n/a"
         )
+        source_target_resolution_text = (
+            f"{generation.get('source_output_width', 'n/a')}x{generation.get('source_output_height', 'n/a')}"
+            if generation.get("preserve_source_exact_size")
+            else "n/a"
+        )
         attempt_count = len(generation.get("attempts") or [])
         status_text = (
             f"Job {job_id}\n"
             f"Status: {result.get('status')}\n"
             f"Mask: {first_mask.get('engine', 'n/a')} / {output.get('face_mask_strategy', 'n/a')} / {output.get('face_mask_mode', 'n/a')}\n"
             f"Quality: {generation.get('quality_mode', 'n/a')} ({generation.get('prompt_intent', 'n/a')})\n"
+            f"Source target: {source_target_resolution_text}\n"
             f"Generated: {generated_resolution_text}\n"
             f"Delivered: {delivered_resolution_text}\n"
             f"Face coverage: {generation.get('face_coverage', 'n/a')}\n"
@@ -311,8 +317,8 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
                 choices=["detail", "classic", "auto", "off"],
                 value="detail",
             )
-            width = gr.Textbox(label="Width (optional)", placeholder="Leave blank for HQ auto")
-            height = gr.Textbox(label="Height (optional)", placeholder="Leave blank for HQ auto")
+            width = gr.Textbox(label="Width (optional)", placeholder="Leave blank to match source size")
+            height = gr.Textbox(label="Height (optional)", placeholder="Leave blank to match source size")
 
     run_button = gr.Button("Run Test", variant="primary")
     status_box = gr.Textbox(label="Status", lines=8)

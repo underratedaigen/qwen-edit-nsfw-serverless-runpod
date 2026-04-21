@@ -389,6 +389,20 @@ def _align_dimension(value: float, multiple: int, round_up: bool = True) -> int:
     return max(multiple, int(rounded) * multiple)
 
 
+def _resolve_source_native_size(
+    reference_image: Image.Image | None,
+    size_multiple: int,
+) -> tuple[int, int, int, int] | None:
+    if reference_image is None or reference_image.width <= 0 or reference_image.height <= 0:
+        return None
+
+    source_width = int(reference_image.width)
+    source_height = int(reference_image.height)
+    internal_width = _align_dimension(source_width, size_multiple, round_up=True)
+    internal_height = _align_dimension(source_height, size_multiple, round_up=True)
+    return source_width, source_height, internal_width, internal_height
+
+
 def _resolve_generation_size(
     requested_width: int | None,
     requested_height: int | None,
@@ -491,10 +505,27 @@ def _finalize_output_resolution(
     minimum_short_edge: int,
     minimum_pixels: int,
     upscale_mode: str,
+    exact_output_size: tuple[int, int] | None = None,
 ) -> tuple[Image.Image, Dict[str, Any]]:
     width, height = image.size
     if width <= 0 or height <= 0:
         return image, {"upscaled": False, "original_width": width, "original_height": height}
+
+    if exact_output_size is not None:
+        target_width, target_height = int(exact_output_size[0]), int(exact_output_size[1])
+        if target_width > 0 and target_height > 0:
+            if (width, height) != (target_width, target_height):
+                image = image.resize((target_width, target_height), resample=Image.Resampling.LANCZOS)
+            return image, {
+                "upscaled": False,
+                "original_width": width,
+                "original_height": height,
+                "matched_source_size": True,
+                "target_width": target_width,
+                "target_height": target_height,
+                "postprocessed": False,
+                "upscale_mode": "off",
+            }
 
     long_edge = max(width, height)
     short_edge = min(width, height)
@@ -1109,6 +1140,7 @@ class QwenRunpodService:
         image_format: str,
         upload_to_bucket: bool,
         upscale_mode: str,
+        exact_output_size: tuple[int, int] | None = None,
     ) -> List[Dict[str, Any]]:
         image_format = image_format.lower()
         if image_format == "jpg":
@@ -1128,6 +1160,7 @@ class QwenRunpodService:
                 minimum_short_edge=self.config.minimum_output_short_edge,
                 minimum_pixels=self.config.minimum_output_pixels,
                 upscale_mode=upscale_mode,
+                exact_output_size=exact_output_size,
             )
             image_bytes = _pil_to_bytes(image, image_format)
             file_name = f"output_{index}.{image_format}"
@@ -1208,6 +1241,8 @@ class QwenRunpodService:
         negative_prompt = _merge_negative_prompt(str(job_input.get("negative_prompt", " ")), enforce_identity_lock)
         requested_height = _to_optional_int(job_input.get("height"))
         requested_width = _to_optional_int(job_input.get("width"))
+        preserve_source_exact_size = requested_width is None and requested_height is None and bool(images)
+        source_output_size: tuple[int, int] | None = None
         native_min_long, native_min_short, native_min_pixels, native_max_long = _resolve_native_constraints(
             quality_mode=quality_mode if self.config.adaptive_generation else self.config.quality_mode,
             face_coverage=face_coverage,
@@ -1216,16 +1251,36 @@ class QwenRunpodService:
             minimum_pixels=self.config.minimum_native_pixels,
             maximum_long_edge=self.config.maximum_native_long_edge,
         )
-        width, height = _resolve_generation_size(
-            requested_width=requested_width,
-            requested_height=requested_height,
-            reference_image=images[0] if images else None,
-            minimum_long_edge=native_min_long,
-            minimum_short_edge=native_min_short,
-            minimum_pixels=native_min_pixels,
-            maximum_long_edge=native_max_long,
-            size_multiple=self.config.generation_size_multiple,
-        )
+        if preserve_source_exact_size:
+            source_size = _resolve_source_native_size(
+                reference_image=images[0],
+                size_multiple=self.config.generation_size_multiple,
+            )
+            if source_size is not None:
+                source_output_width, source_output_height, width, height = source_size
+                source_output_size = (source_output_width, source_output_height)
+            else:
+                width, height = _resolve_generation_size(
+                    requested_width=requested_width,
+                    requested_height=requested_height,
+                    reference_image=images[0] if images else None,
+                    minimum_long_edge=native_min_long,
+                    minimum_short_edge=native_min_short,
+                    minimum_pixels=native_min_pixels,
+                    maximum_long_edge=native_max_long,
+                    size_multiple=self.config.generation_size_multiple,
+                )
+        else:
+            width, height = _resolve_generation_size(
+                requested_width=requested_width,
+                requested_height=requested_height,
+                reference_image=images[0] if images else None,
+                minimum_long_edge=native_min_long,
+                minimum_short_edge=native_min_short,
+                minimum_pixels=native_min_pixels,
+                maximum_long_edge=native_max_long,
+                size_multiple=self.config.generation_size_multiple,
+            )
         explicit_guidance = _has_explicit_value(job_input, "true_guidance_scale")
         explicit_steps = _has_explicit_value(job_input, "num_inference_steps")
         true_guidance_scale = (
@@ -1263,7 +1318,9 @@ class QwenRunpodService:
         print(
             f"[generation] native size {width}x{height}, steps={num_inference_steps}, "
             f"true_cfg_scale={true_guidance_scale}, quality_mode={quality_mode}, "
-            f"mask={face_mask_strategy}/{face_mask_mode}@{round(face_mask_strength, 3)}"
+            f"mask={face_mask_strategy}/{face_mask_mode}@{round(face_mask_strength, 3)}, "
+            f"preserve_source_exact_size={preserve_source_exact_size}, "
+            f"source_output_size={source_output_size}"
         )
 
         started_at = time.time()
@@ -1313,6 +1370,7 @@ class QwenRunpodService:
             image_format=output_format,
             upload_to_bucket=upload_to_bucket,
             upscale_mode=postprocess_upscale_mode,
+            exact_output_size=source_output_size if preserve_source_exact_size else None,
         )
         serialized_debug_masks: List[Dict[str, Any]] = []
         if debug_masks:
@@ -1348,6 +1406,9 @@ class QwenRunpodService:
             "generation": {
                 "width": width,
                 "height": height,
+                "preserve_source_exact_size": preserve_source_exact_size,
+                "source_output_width": source_output_size[0] if source_output_size else None,
+                "source_output_height": source_output_size[1] if source_output_size else None,
                 "num_inference_steps": num_inference_steps,
                 "true_guidance_scale": true_guidance_scale,
                 "quality_mode": quality_mode,
