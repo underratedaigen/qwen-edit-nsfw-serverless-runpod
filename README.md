@@ -56,8 +56,8 @@ The Runpod handler accepts payloads like this:
     "randomize_seed": false,
     "quality_mode": "balanced",
     "rewrite_prompt": false,
-    "face_mask_strategy": "smart",
-    "face_mask_mode": "surface_fx",
+    "face_mask_strategy": "strict_identity",
+    "face_mask_mode": "strict",
     "face_mask_strength": 0.86,
     "debug_masks": false,
     "postprocess_upscale_mode": "detail",
@@ -142,8 +142,8 @@ The client lets you:
 - upload one image
 - enter a prompt
 - keep `Lock Face Identity` enabled to preserve the source face during edits
-- the worker now uses one strict identity-lock path when `Lock Face Identity` is enabled
-- liquid prompts such as droplets, sweat, tears, wet skin, or pool-water effects get a second recovery pass that transfers only the new surface detail back onto the locked face
+- the worker now uses one strict, source-dominant identity-lock path when `Lock Face Identity` is enabled
+- face-surface prompts such as droplets, sweat, tears, wet skin, makeup, lashes, or glitter get a second recovery pass that transfers only local surface changes back onto the locked face
 - use `Mask Strength` to tune how strongly the source face is preserved
 - keep `Auto Steps` and `Auto Guidance` enabled if you want the worker to pick better values automatically
 - choose `Quality Mode` to trade speed vs image quality
@@ -155,7 +155,7 @@ The client lets you:
 - submit the job to Runpod
 - preview the returned image
 - inspect the mask engine, quality mode, face coverage, identity drift score, native generated size, and final delivered size in the status box
-- receive outputs that are automatically upscaled to at least 1920 on the long edge, 1080 on the short edge, and 2,073,600 total pixels
+- receive outputs that stay capped to about `1080p` / `2 MP` instead of being force-upscaled
 - inspect the raw JSON response and returned debug masks
 
 ## Step-by-step Runpod deployment

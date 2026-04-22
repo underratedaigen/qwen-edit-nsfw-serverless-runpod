@@ -105,8 +105,10 @@ Please strictly follow the rewriting rules below:
 
 IDENTITY_LOCK_INSTRUCTION = (
     "Preserve the subject's face and identity exactly as in the source image. "
-    "Do not change facial structure, skin texture, eye shape, eye color, eyebrows, nose, lips, teeth, ears, age, "
-    "expression, head shape, hairstyle, hairline, or any distinguishing facial detail. "
+    "Do not change head shape, face width or height ratio, jawline, cheek volume, asymmetry, smile geometry, teeth spacing, "
+    "eye shape, eye squint, eye color, eyebrow shape, nose shape, lip shape, skin tone, natural skin texture, wrinkles, folds, "
+    "expression lines, hairstyle, or hairline framing around the face. "
+    "Do not beautify, idealize, symmetrize, smooth, or improve the face unless the user explicitly requests a face-surface effect. "
     "Keep the face aligned, natural, and unchanged even if the user prompt requests otherwise."
 )
 
@@ -114,7 +116,8 @@ IDENTITY_LOCK_NEGATIVE_PROMPT = (
     "changed face, different face, altered identity, new identity, face swap, different person, "
     "modified facial features, altered eyes, altered eyebrows, altered nose, altered lips, altered jawline, "
     "altered cheekbones, altered skin texture, altered hairline, altered hairstyle, de-aged face, aged face, "
-    "beautified face, retouched face, distorted face, asymmetrical face, malformed face, duplicated face"
+    "beautified face, retouched face, distorted face, malformed face, duplicated face, smoothed skin, airbrushed skin, "
+    "idealized face, symmetrical face, corrected asymmetry, reshaped face, slimmer face, larger eyes, smaller nose, fuller lips"
 )
 
 COMPOSITION_LOCK_INSTRUCTION = (

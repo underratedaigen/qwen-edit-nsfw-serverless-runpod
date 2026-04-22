@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Sequence
 
@@ -197,6 +198,51 @@ SHEEN_HINTS = (
     "shimmer",
 )
 
+SURFACE_EFFECT_HINTS = tuple(
+    dict.fromkeys(
+        (
+            *LIQUID_HINTS,
+            "glitter",
+            "glittery",
+            "sparkle",
+            "sparkly",
+            "shimmer",
+            "shimmery",
+            "makeup",
+            "eyelash",
+            "eyelashes",
+            "lashes",
+            "eyeliner",
+            "mascara",
+            "lipstick",
+            "blush",
+            "freckles",
+        )
+    )
+)
+
+SURFACE_EFFECT_CORE_HINTS = (
+    "eyelash",
+    "eyelashes",
+    "lashes",
+    "eyeliner",
+    "mascara",
+    "lipstick",
+)
+
+SURFACE_EFFECT_COLOR_HINTS = (
+    "makeup",
+    "lipstick",
+    "blush",
+    "glitter",
+    "glittery",
+    "sparkle",
+    "sparkly",
+    "shimmer",
+    "shimmery",
+    "freckles",
+)
+
 
 def _connection_ids(connections: Iterable[tuple[int, int]]) -> list[int]:
     ids: set[int] = set()
@@ -382,6 +428,32 @@ def _mask_from_points(
     return mask
 
 
+def _mask_from_ellipse(
+    size: tuple[int, int],
+    center: tuple[float, float],
+    radius_x: float,
+    radius_y: float,
+    blur_radius: float,
+) -> Image.Image:
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    cx, cy = center
+    if radius_x <= 0.0 or radius_y <= 0.0:
+        return mask
+    draw.ellipse(
+        (
+            float(cx - radius_x),
+            float(cy - radius_y),
+            float(cx + radius_x),
+            float(cy + radius_y),
+        ),
+        fill=255,
+    )
+    if blur_radius > 0:
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    return mask
+
+
 def _scale_points(
     points: np.ndarray,
     center: tuple[float, float],
@@ -516,6 +588,38 @@ def _uses_broad_surface_sheen(prompt: str | None) -> bool:
     if not normalized:
         return False
     return any(term in normalized for term in SHEEN_HINTS)
+
+
+def _surface_effect_terms(prompt: str | None) -> list[str]:
+    normalized = _normalize_prompt(prompt)
+    if not normalized:
+        return []
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for term in SURFACE_EFFECT_HINTS:
+        if term in normalized and term not in seen:
+            seen.add(term)
+            ordered.append(term)
+    return ordered
+
+
+def _requests_surface_effect(prompt: str | None) -> bool:
+    return bool(_surface_effect_terms(prompt))
+
+
+def _uses_core_surface_effects(prompt: str | None) -> bool:
+    normalized = _normalize_prompt(prompt)
+    if not normalized:
+        return False
+    return any(term in normalized for term in SURFACE_EFFECT_CORE_HINTS)
+
+
+def _uses_color_surface_effects(prompt: str | None) -> bool:
+    normalized = _normalize_prompt(prompt)
+    if not normalized:
+        return False
+    return any(term in normalized for term in SURFACE_EFFECT_COLOR_HINTS)
 
 
 def _detect_exposed_skin_mask(image: Image.Image) -> Image.Image:
@@ -682,20 +786,30 @@ class FaceIdentityMasker:
                 )
                 if (
                     similarity_error is not None
-                    and similarity_error <= 0.14
-                    and 0.72 <= similarity_scale <= 1.38
+                    and similarity_error <= 0.115
+                    and 0.78 <= similarity_scale <= 1.28
                     and (
                         affine_error is None
-                        or similarity_error <= (affine_error + 0.015)
-                        or affine_error > 0.08
+                        or similarity_error <= (affine_error + 0.01)
+                        or affine_error > 0.055
                     )
                 ):
                     chosen_transform = similarity_affine
                     chosen_method = f"face_similarity:{similarity_error:.4f}"
 
-            if chosen_transform is None and affine_transform is not None and affine_error is not None and affine_error <= 0.085:
-                chosen_transform = affine_transform
-                chosen_method = f"face_affine:{affine_error:.4f}"
+            if chosen_transform is None and affine_transform is not None and affine_error is not None:
+                affine_scale_x = float(np.linalg.norm(affine_transform[:2, 0]))
+                affine_scale_y = float(np.linalg.norm(affine_transform[:2, 1]))
+                min_affine_scale = max(min(affine_scale_x, affine_scale_y), 1e-6)
+                affine_anisotropy = max(affine_scale_x, affine_scale_y) / min_affine_scale
+                if (
+                    affine_error <= 0.055
+                    and 0.8 <= affine_scale_x <= 1.24
+                    and 0.8 <= affine_scale_y <= 1.24
+                    and affine_anisotropy <= 1.08
+                ):
+                    chosen_transform = affine_transform
+                    chosen_method = f"face_affine:{affine_error:.4f}"
 
             if chosen_transform is not None:
                 return (
@@ -1245,6 +1359,320 @@ class FaceIdentityMasker:
         mask = _expand_mask(mask, expand_px=max(1, int(base / 520)), blur_radius=max(1.5, base / 420.0))
         return mask
 
+    def _build_expression_lock_masks(
+        self,
+        size: tuple[int, int],
+        landmarks: list[tuple[float, float]],
+        face_mask: Image.Image,
+        core_mask: Image.Image,
+        contour_mask: Image.Image,
+    ) -> Dict[str, Image.Image]:
+        empty = Image.new("L", size, 0)
+        bbox = self._face_bbox(landmarks)
+        if bbox is None:
+            return {
+                "eyes": empty,
+                "smile": empty,
+                "jaw_cheeks": empty,
+                "expression": empty,
+            }
+
+        base = max(size)
+        x1, y1, x2, y2 = bbox
+        face_width = max(1.0, x2 - x1)
+        face_height = max(1.0, y2 - y1)
+        face_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        left_eye = _mean_point([landmarks[index] for index in LEFT_EYE_CENTER_INDICES])
+        right_eye = _mean_point([landmarks[index] for index in RIGHT_EYE_CENTER_INDICES])
+        eye_center = ((left_eye[0] + right_eye[0]) / 2.0, (left_eye[1] + right_eye[1]) / 2.0)
+        mouth_left = landmarks[MOUTH_CORNER_LEFT_INDEX]
+        mouth_right = landmarks[MOUTH_CORNER_RIGHT_INDEX]
+        mouth_center = ((mouth_left[0] + mouth_right[0]) / 2.0, (mouth_left[1] + mouth_right[1]) / 2.0)
+
+        eye_mask = self._mask_from_indices(
+            size,
+            landmarks,
+            [
+                [*self._left_eye_ids, *self._left_brow_ids],
+                [*self._right_eye_ids, *self._right_brow_ids],
+            ],
+            blur_radius=max(2.0, base / 260.0),
+        )
+        eye_mask = _union_masks(
+            eye_mask,
+            _mask_from_ellipse(
+                size,
+                center=(eye_center[0], eye_center[1] - (0.02 * face_height)),
+                radius_x=face_width * 0.38,
+                radius_y=face_height * 0.19,
+                blur_radius=max(2.0, base / 240.0),
+            ),
+        )
+        eye_mask = _expand_mask(
+            eye_mask,
+            expand_px=max(2, int(base / 260)),
+            blur_radius=max(1.8, base / 260.0),
+        )
+        eye_mask = _intersect_masks(eye_mask, face_mask)
+
+        smile_mask = self._mask_from_indices(
+            size,
+            landmarks,
+            [
+                self._lip_ids,
+                [MOUTH_CORNER_LEFT_INDEX, 13, MOUTH_CORNER_RIGHT_INDEX, 14],
+            ],
+            blur_radius=max(2.0, base / 260.0),
+        )
+        smile_mask = _union_masks(
+            smile_mask,
+            _mask_from_ellipse(
+                size,
+                center=(mouth_center[0], mouth_center[1] - (0.015 * face_height)),
+                radius_x=face_width * 0.34,
+                radius_y=face_height * 0.21,
+                blur_radius=max(2.0, base / 220.0),
+            ),
+        )
+        smile_mask = _expand_mask(
+            smile_mask,
+            expand_px=max(2, int(base / 240)),
+            blur_radius=max(2.0, base / 240.0),
+        )
+        smile_mask = _intersect_masks(smile_mask, face_mask)
+
+        jaw_cheek_mask = _mask_from_ellipse(
+            size,
+            center=(face_center[0], face_center[1] + (0.18 * face_height)),
+            radius_x=face_width * 0.46,
+            radius_y=face_height * 0.31,
+            blur_radius=max(2.0, base / 220.0),
+        )
+        jaw_cheek_mask = _union_masks(jaw_cheek_mask, contour_mask)
+        jaw_cheek_mask = _intersect_masks(jaw_cheek_mask, face_mask)
+
+        expression_mask = _union_masks(eye_mask, smile_mask, jaw_cheek_mask, core_mask)
+        expression_mask = _intersect_masks(expression_mask, face_mask)
+
+        return {
+            "eyes": eye_mask,
+            "smile": smile_mask,
+            "jaw_cheeks": jaw_cheek_mask,
+            "expression": expression_mask,
+        }
+
+    def _reinforce_strict_identity(
+        self,
+        source_image: Image.Image,
+        generated_image: Image.Image,
+        protected_result: FaceMaskResult,
+        strength: float,
+        debug: bool,
+    ) -> FaceMaskResult:
+        if not protected_result.applied:
+            protected_result.metadata["strict_reinforcement_applied"] = False
+            protected_result.metadata["strict_reinforcement_reason"] = "strict-mask-not-applied"
+            return protected_result
+
+        protected_image = protected_result.image.convert("RGB")
+        raw_generated = generated_image.convert("RGB")
+        base = max(protected_image.size)
+        clamped_strength = float(np.clip(strength, 0.0, 1.0))
+
+        aligned_source, source_landmarks, protected_landmarks, alignment_method = self._align_source_to_generated(
+            source_image,
+            protected_image,
+        )
+        if not source_landmarks:
+            protected_result.metadata["strict_reinforcement_applied"] = False
+            protected_result.metadata["strict_reinforcement_reason"] = "no-source-face"
+            protected_result.metadata["strict_reinforcement_alignment_method"] = alignment_method
+            return protected_result
+        if not protected_landmarks:
+            protected_result.metadata["strict_reinforcement_applied"] = False
+            protected_result.metadata["strict_reinforcement_reason"] = "no-output-face"
+            protected_result.metadata["strict_reinforcement_alignment_method"] = alignment_method
+            return protected_result
+
+        parser_face: ParserFaceData | None = None
+        parser_error: str | None = None
+        try:
+            parser_face = self._parse_face_regions(protected_image)
+            region_masks = self._build_smart_masks(protected_image.size, protected_landmarks, parser_face)
+            face_mask = _subtract_masks(
+                region_masks["face"],
+                region_masks["hairline"],
+                blur_radius=max(1.0, base / 360.0),
+            )
+            core_mask = region_masks["core"]
+            contour_mask = _subtract_masks(region_masks["contour"], core_mask)
+            hairline_mask = _subtract_masks(region_masks["hairline"], core_mask, region_masks["contour"])
+            surface_mask = _subtract_masks(
+                region_masks["surface"],
+                region_masks["core"],
+                region_masks["contour"],
+                region_masks["hairline"],
+                blur_radius=max(1.2, base / 340.0),
+            )
+            remainder_mask = _subtract_masks(
+                region_masks["remainder"],
+                region_masks["core"],
+                region_masks["contour"],
+                region_masks["hairline"],
+                region_masks["surface"],
+                blur_radius=max(1.0, base / 360.0),
+            )
+        except Exception as exc:
+            parser_error = str(exc)
+            face_mask, core_mask, contour_mask = self._build_legacy_masks(protected_image.size, protected_landmarks)
+            hairline_mask = Image.new("L", protected_image.size, 0)
+            surface_mask = _subtract_masks(
+                face_mask,
+                core_mask,
+                contour_mask,
+                blur_radius=max(1.2, base / 340.0),
+            )
+            remainder_mask = surface_mask
+
+        shape_locked_source, face_shape_mask, face_shape_inner_mask, shape_meta = self._build_face_shape_lock(
+            aligned_source=aligned_source,
+            source_landmarks=source_landmarks,
+            generated_landmarks=protected_landmarks,
+            source_size=source_image.size,
+            output_size=protected_image.size,
+        )
+        expression_masks = self._build_expression_lock_masks(
+            size=protected_image.size,
+            landmarks=protected_landmarks,
+            face_mask=face_mask,
+            core_mask=core_mask,
+            contour_mask=contour_mask,
+        )
+
+        full_face_mask = _union_masks(face_mask, face_shape_mask, expression_masks["jaw_cheeks"])
+        structure_mask = _union_masks(core_mask, expression_masks["expression"], face_shape_inner_mask)
+        surface_structure_mask = _union_masks(surface_mask, remainder_mask, expression_masks["jaw_cheeks"])
+        full_face_inner_mask = _union_masks(structure_mask, face_shape_inner_mask)
+
+        source_array = np.asarray(aligned_source.convert("RGB"), dtype=np.float32)
+        shape_locked_source_array = np.asarray(shape_locked_source.convert("RGB"), dtype=np.float32)
+        protected_array = np.asarray(protected_image, dtype=np.float32)
+        raw_array = np.asarray(raw_generated.resize(protected_image.size, resample=Image.Resampling.BICUBIC), dtype=np.float32)
+
+        full_face_source = np.clip((shape_locked_source_array * 0.9) + (source_array * 0.1), 0, 255)
+        feature_source = np.clip((source_array * 0.82) + (shape_locked_source_array * 0.18), 0, 255)
+        tone_reference = np.clip((shape_locked_source_array * 0.72) + (source_array * 0.28), 0, 255)
+
+        final = protected_array.copy()
+        low_freq_alpha = _mask_to_array(full_face_mask) * (0.64 + (0.2 * clamped_strength))
+        if float(low_freq_alpha.max()) > 0.0:
+            final_low = _blur_rgb_array(final, radius=max(10.0, base / 72.0))
+            source_low = _blur_rgb_array(tone_reference, radius=max(10.0, base / 72.0))
+            final = np.clip(final + ((source_low - final_low) * low_freq_alpha), 0, 255)
+
+        hairline_alpha = _mask_to_array(hairline_mask) * (0.66 + (0.16 * clamped_strength))
+        if float(hairline_alpha.max()) > 0.0:
+            hairline_source = np.clip((source_array * 0.97) + (protected_array * 0.03), 0, 255)
+            final = (final * (1.0 - hairline_alpha)) + (hairline_source * hairline_alpha)
+
+        full_face_alpha = _mask_to_array(full_face_mask) * (0.58 + (0.18 * clamped_strength))
+        if float(full_face_alpha.max()) > 0.0:
+            full_face_blend = np.clip((full_face_source * 0.992) + (protected_array * 0.008), 0, 255)
+            final = (final * (1.0 - full_face_alpha)) + (full_face_blend * full_face_alpha)
+
+        surface_alpha = _mask_to_array(surface_structure_mask) * (0.74 + (0.14 * clamped_strength))
+        if float(surface_alpha.max()) > 0.0:
+            surface_blend = np.clip((full_face_source * 0.986) + (protected_array * 0.014), 0, 255)
+            final = (final * (1.0 - surface_alpha)) + (surface_blend * surface_alpha)
+
+        expression_alpha = _mask_to_array(expression_masks["expression"]) * (0.86 + (0.12 * clamped_strength))
+        if float(expression_alpha.max()) > 0.0:
+            expression_blend = np.clip((feature_source * 0.996) + (raw_array * 0.004), 0, 255)
+            final = (final * (1.0 - expression_alpha)) + (expression_blend * expression_alpha)
+
+        structure_alpha = _mask_to_array(structure_mask) * min(1.0, 0.94 + (0.08 * clamped_strength))
+        if float(structure_alpha.max()) > 0.0:
+            structure_blend = np.clip((feature_source * 0.998) + (raw_array * 0.002), 0, 255)
+            final = (final * (1.0 - structure_alpha)) + (structure_blend * structure_alpha)
+
+        shape_lock_strength = min(1.0, 0.84 + (0.14 * clamped_strength))
+        shape_alpha = _mask_to_array(face_shape_mask) * shape_lock_strength
+        if float(shape_alpha.max()) > 0.0:
+            shape_blend = np.clip((shape_locked_source_array * 0.998) + (protected_array * 0.002), 0, 255)
+            final = (final * (1.0 - shape_alpha)) + (shape_blend * shape_alpha)
+
+        shape_inner_alpha = _mask_to_array(full_face_inner_mask) * min(1.0, shape_lock_strength + 0.08)
+        if float(shape_inner_alpha.max()) > 0.0:
+            final = (final * (1.0 - shape_inner_alpha)) + (shape_locked_source_array * shape_inner_alpha)
+
+        texture_mask = _union_masks(surface_structure_mask, structure_mask, face_shape_inner_mask)
+        final, tone_lock_coverage = self._apply_face_tone_lock(
+            working_array=final,
+            source_array=tone_reference,
+            face_mask=full_face_mask,
+            radius=max(8.0, base / 86.0),
+            strength=0.78 + (0.16 * clamped_strength),
+        )
+        final, texture_lock_coverage = self._apply_face_texture_lock(
+            working_array=final,
+            source_array=feature_source,
+            face_mask=texture_mask,
+            radius=max(1.8, base / 250.0),
+            strength=0.64 + (0.18 * clamped_strength),
+        )
+
+        highlight_lock_mask = self._build_highlight_lock_mask(aligned_source, protected_image, full_face_mask)
+        highlight_alpha = _mask_to_array(highlight_lock_mask) * (0.92 + (0.08 * clamped_strength))
+        if float(highlight_alpha.max()) > 0.0:
+            highlight_blend = np.clip((source_array * 0.988) + (feature_source * 0.012), 0, 255)
+            final = (final * (1.0 - highlight_alpha)) + (highlight_blend * highlight_alpha)
+
+        metadata = dict(protected_result.metadata)
+        metadata["strict_reinforcement_applied"] = True
+        metadata["strict_reinforcement_reason"] = "source-dominant-face-composite"
+        metadata["strict_reinforcement_alignment_method"] = alignment_method
+        metadata["strict_reinforcement_full_face_coverage"] = round(float((np.asarray(full_face_mask, dtype=np.uint8) > 0).mean()), 4)
+        metadata["strict_reinforcement_expression_coverage"] = round(float((np.asarray(expression_masks["expression"], dtype=np.uint8) > 0).mean()), 4)
+        metadata["strict_reinforcement_structure_coverage"] = round(float((np.asarray(structure_mask, dtype=np.uint8) > 0).mean()), 4)
+        metadata["strict_reinforcement_hairline_coverage"] = round(float((np.asarray(hairline_mask, dtype=np.uint8) > 0).mean()), 4)
+        metadata["strict_reinforcement_tone_lock_coverage"] = round(tone_lock_coverage, 4)
+        metadata["strict_reinforcement_texture_lock_coverage"] = round(texture_lock_coverage, 4)
+        metadata["strict_reinforcement_highlight_coverage"] = round(float((np.asarray(highlight_lock_mask, dtype=np.uint8) > 0).mean()), 4)
+        metadata["strict_reinforcement_strength"] = round(clamped_strength, 3)
+        for key, value in shape_meta.items():
+            metadata[f"strict_reinforcement_shape_{key}"] = value
+        if parser_face is not None and parser_face.score is not None:
+            metadata["strict_reinforcement_parser_score"] = parser_face.score
+        if parser_error:
+            metadata["strict_reinforcement_parser_fallback"] = parser_error
+
+        debug_images = dict(protected_result.debug_images)
+        if debug:
+            debug_images["mask_strict_full_face"] = full_face_mask.convert("L")
+            debug_images["mask_strict_expression"] = expression_masks["expression"].convert("L")
+            debug_images["mask_strict_structure"] = structure_mask.convert("L")
+            debug_images["mask_strict_hairline"] = hairline_mask.convert("L")
+            debug_images["overlay_strict_identity"] = _overlay_regions(
+                protected_image,
+                {
+                    "face": full_face_mask,
+                    "surface": surface_structure_mask,
+                    "core": structure_mask,
+                    "contour": expression_masks["jaw_cheeks"],
+                    "hairline": hairline_mask,
+                },
+            )
+
+        return FaceMaskResult(
+            image=Image.fromarray(np.clip(final, 0, 255).astype(np.uint8), mode="RGB"),
+            applied=protected_result.applied,
+            mode="strict",
+            reason=f"{protected_result.reason}; strict-source-dominant-composite",
+            engine=protected_result.engine,
+            metadata=metadata,
+            debug_images=debug_images,
+        )
+
     def _apply_face_tone_lock(
         self,
         working_array: np.ndarray,
@@ -1282,6 +1710,36 @@ class FaceIdentityMasker:
         corrected = np.clip(working_array + ((source_texture - working_texture) * alpha), 0, 255)
         coverage = float((np.asarray(face_mask, dtype=np.uint8) > 0).mean())
         return corrected, coverage
+
+    def _feature_geometry_signature(self, landmarks: list[tuple[float, float]]) -> Dict[str, float] | None:
+        bbox = self._face_bbox(landmarks)
+        if bbox is None:
+            return None
+
+        x1, y1, x2, y2 = bbox
+        face_width = max(1.0, x2 - x1)
+        face_height = max(1.0, y2 - y1)
+        left_eye = _mean_point([landmarks[index] for index in LEFT_EYE_CENTER_INDICES])
+        right_eye = _mean_point([landmarks[index] for index in RIGHT_EYE_CENTER_INDICES])
+        nose_tip = landmarks[NOSE_TIP_INDEX]
+        mouth_left = landmarks[MOUTH_CORNER_LEFT_INDEX]
+        mouth_right = landmarks[MOUTH_CORNER_RIGHT_INDEX]
+        mouth_center = ((mouth_left[0] + mouth_right[0]) / 2.0, (mouth_left[1] + mouth_right[1]) / 2.0)
+        eye_center = ((left_eye[0] + right_eye[0]) / 2.0, (left_eye[1] + right_eye[1]) / 2.0)
+        upper_lip = landmarks[13]
+        lower_lip = landmarks[14]
+
+        return {
+            "face_aspect_ratio": face_width / face_height,
+            "eye_span": math.dist(left_eye, right_eye) / face_width,
+            "mouth_span": math.dist(mouth_left, mouth_right) / face_width,
+            "eye_to_mouth": abs(mouth_center[1] - eye_center[1]) / face_height,
+            "nose_to_mouth": math.dist(nose_tip, mouth_center) / face_height,
+            "left_eye_open": abs(landmarks[159][1] - landmarks[145][1]) / face_height,
+            "right_eye_open": abs(landmarks[386][1] - landmarks[374][1]) / face_height,
+            "mouth_open": abs(upper_lip[1] - lower_lip[1]) / face_height,
+            "mouth_tilt": abs(mouth_left[1] - mouth_right[1]) / face_height,
+        }
 
     def assess_identity_drift(
         self,
@@ -1357,6 +1815,31 @@ class FaceIdentityMasker:
             if source_diag > 1e-6 and generated_diag > 1e-6:
                 face_scale_error = float(abs(math.log(generated_diag / source_diag)))
 
+        feature_error = 0.0
+        aspect_ratio_error = 0.0
+        source_signature = self._feature_geometry_signature(source_landmarks)
+        generated_signature = self._feature_geometry_signature(generated_landmarks)
+        if source_signature is not None and generated_signature is not None:
+            aspect_ratio_error = float(
+                abs(
+                    math.log(
+                        max(generated_signature["face_aspect_ratio"], 1e-6)
+                        / max(source_signature["face_aspect_ratio"], 1e-6)
+                    )
+                )
+            )
+            feature_components = [
+                abs(generated_signature["eye_span"] - source_signature["eye_span"]) / 0.03,
+                abs(generated_signature["mouth_span"] - source_signature["mouth_span"]) / 0.035,
+                abs(generated_signature["eye_to_mouth"] - source_signature["eye_to_mouth"]) / 0.03,
+                abs(generated_signature["nose_to_mouth"] - source_signature["nose_to_mouth"]) / 0.028,
+                abs(generated_signature["mouth_tilt"] - source_signature["mouth_tilt"]) / 0.018,
+                abs(generated_signature["mouth_open"] - source_signature["mouth_open"]) / 0.022,
+                abs(generated_signature["left_eye_open"] - source_signature["left_eye_open"]) / 0.018,
+                abs(generated_signature["right_eye_open"] - source_signature["right_eye_open"]) / 0.018,
+            ]
+            feature_error = float(np.mean(np.clip(feature_components, 0.0, 1.0)))
+
         highlight_mask = self._build_highlight_lock_mask(aligned_source, generated_rgb, face_mask)
         highlight_bool = np.asarray(highlight_mask, dtype=np.uint8) > 0
         if bool(highlight_bool.any()):
@@ -1373,12 +1856,16 @@ class FaceIdentityMasker:
         core_norm = float(np.clip(core_pixel_delta / 0.07, 0.0, 1.0))
         highlight_norm = float(np.clip(highlight_luminance_delta / 0.08, 0.0, 1.0))
         scale_norm = float(np.clip(face_scale_error / 0.07, 0.0, 1.0))
+        feature_norm = float(np.clip(feature_error, 0.0, 1.0))
+        aspect_norm = float(np.clip(aspect_ratio_error / 0.055, 0.0, 1.0))
         score = float(
-            (0.28 * geometry_norm)
-            + (0.22 * face_norm)
-            + (0.24 * core_norm)
-            + (0.10 * highlight_norm)
-            + (0.16 * scale_norm)
+            (0.24 * geometry_norm)
+            + (0.17 * face_norm)
+            + (0.19 * core_norm)
+            + (0.1 * highlight_norm)
+            + (0.12 * scale_norm)
+            + (0.12 * feature_norm)
+            + (0.06 * aspect_norm)
         )
 
         assessment: Dict[str, Any] = {
@@ -1390,6 +1877,8 @@ class FaceIdentityMasker:
             "core_pixel_delta": round(core_pixel_delta, 4),
             "highlight_luminance_delta": round(highlight_luminance_delta, 4),
             "face_scale_error": round(face_scale_error, 4),
+            "feature_geometry_error": round(feature_error, 4),
+            "face_aspect_ratio_error": round(aspect_ratio_error, 4),
             "face_mask_coverage": round(float(face_bool.mean()), 4),
         }
         if parser_face is not None:
@@ -1859,25 +2348,39 @@ class FaceIdentityMasker:
         debug: bool,
     ) -> FaceMaskResult:
         try:
-            result = self._smart_protect(
+            base_result = self._smart_protect(
                 source_image=source_image,
                 generated_image=generated_image,
                 mode="strict",
                 strength=strength,
                 debug=debug,
             )
-            result.metadata.setdefault("fallback", "none")
-            result.metadata.setdefault("base_engine", result.engine)
+            base_result.metadata.setdefault("fallback", "none")
+            base_result.metadata.setdefault("base_engine", base_result.engine)
         except Exception as exc:
-            result = self._legacy_protect(
+            base_result = self._legacy_protect(
                 source_image=source_image,
                 generated_image=generated_image,
                 mode="strict",
                 debug=debug,
             )
-            result.reason = f"{result.reason}; strict-smart-fallback:{exc}"
-            result.metadata["fallback"] = "legacy"
-            result.metadata["base_engine"] = result.engine
+            base_result.reason = f"{base_result.reason}; strict-smart-fallback:{exc}"
+            base_result.metadata["fallback"] = "legacy"
+            base_result.metadata["base_engine"] = base_result.engine
+
+        try:
+            result = self._reinforce_strict_identity(
+                source_image=source_image,
+                generated_image=generated_image,
+                protected_result=base_result,
+                strength=strength,
+                debug=debug,
+            )
+        except Exception as exc:
+            result = base_result
+            result.metadata["strict_reinforcement_applied"] = False
+            result.metadata["strict_reinforcement_reason"] = f"fallback:{exc}"
+            result.reason = f"{result.reason}; strict-reinforcement-fallback:{exc}"
 
         result.mode = "strict"
         result.engine = "strict_identity"
@@ -1893,10 +2396,24 @@ class FaceIdentityMasker:
         prompt: str | None,
         debug: bool,
     ) -> FaceMaskResult:
-        if not protected_result.applied:
+        effect_terms = _surface_effect_terms(prompt)
+        effect_label = "liquid" if _is_liquid_request(prompt) else "surface-effect"
+
+        def mark_not_applied(reason: str, *, alignment: str | None = None) -> FaceMaskResult:
+            protected_result.metadata["surface_effect_recovery_applied"] = False
+            protected_result.metadata["surface_effect_recovery_reason"] = reason
+            protected_result.metadata["surface_effect_terms"] = effect_terms
+            if alignment is not None:
+                protected_result.metadata["surface_effect_recovery_alignment_method"] = alignment
+
             protected_result.metadata["liquid_recovery_applied"] = False
-            protected_result.metadata["liquid_recovery_reason"] = "strict-mask-not-applied"
+            protected_result.metadata["liquid_recovery_reason"] = reason
+            if alignment is not None:
+                protected_result.metadata["liquid_recovery_alignment_method"] = alignment
             return protected_result
+
+        if not protected_result.applied:
+            return mark_not_applied("strict-mask-not-applied")
 
         raw_generated = generated_image.convert("RGB")
         protected_image = protected_result.image.convert("RGB")
@@ -1907,18 +2424,14 @@ class FaceIdentityMasker:
             raw_generated,
         )
         if not source_landmarks:
-            protected_result.metadata["liquid_recovery_applied"] = False
-            protected_result.metadata["liquid_recovery_reason"] = "no-source-face"
-            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
-            return protected_result
+            return mark_not_applied("no-source-face", alignment=alignment_method)
         if not generated_landmarks:
-            protected_result.metadata["liquid_recovery_applied"] = False
-            protected_result.metadata["liquid_recovery_reason"] = "no-output-face"
-            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
-            return protected_result
+            return mark_not_applied("no-output-face", alignment=alignment_method)
 
         parser_face: ParserFaceData | None = None
         region_masks: Dict[str, Image.Image] | None = None
+        allow_core_effects = _uses_core_surface_effects(prompt)
+        allow_color_effects = _uses_color_surface_effects(prompt)
         try:
             parser_face = self._parse_face_regions(raw_generated)
             region_masks = self._build_smart_masks(raw_generated.size, generated_landmarks, parser_face)
@@ -1927,29 +2440,42 @@ class FaceIdentityMasker:
                 region_masks["hairline"],
                 blur_radius=max(1.0, base / 360.0),
             )
-            liquid_region = _subtract_masks(
-                _union_masks(region_masks["surface"], region_masks["remainder"], region_masks["contour"]),
-                region_masks["core"],
+            editable_region = _subtract_masks(
+                _union_masks(
+                    region_masks["surface"],
+                    region_masks["remainder"],
+                    region_masks["contour"],
+                    _expand_mask(
+                        region_masks["core"],
+                        expand_px=max(1, int(base / 540)),
+                        blur_radius=max(1.0, base / 420.0),
+                    ),
+                ),
                 region_masks["hairline"],
                 blur_radius=max(1.2, base / 340.0),
             )
         except Exception as exc:
             parser_face = None
             face_mask, core_mask, contour_mask = self._build_legacy_masks(raw_generated.size, generated_landmarks)
-            liquid_region = _subtract_masks(
-                _union_masks(face_mask, contour_mask),
-                core_mask,
+            editable_region = _subtract_masks(
+                _union_masks(face_mask, contour_mask, _expand_mask(core_mask, expand_px=max(1, int(base / 540)), blur_radius=max(1.0, base / 420.0))),
+                Image.new("L", raw_generated.size, 0),
                 blur_radius=max(1.2, base / 320.0),
             )
+            protected_result.metadata["surface_effect_recovery_parser_fallback"] = str(exc)
             protected_result.metadata["liquid_recovery_parser_fallback"] = str(exc)
 
-        liquid_region = _intersect_masks(liquid_region, face_mask)
-        region_bool = np.asarray(liquid_region, dtype=np.uint8) > 0
+        if not allow_core_effects and parser_face is not None and region_masks is not None:
+            editable_region = _subtract_masks(
+                editable_region,
+                region_masks["core"],
+                blur_radius=max(1.0, base / 420.0),
+            )
+
+        effect_region = _intersect_masks(editable_region, face_mask)
+        region_bool = np.asarray(effect_region, dtype=np.uint8) > 0
         if not bool(region_bool.any()):
-            protected_result.metadata["liquid_recovery_applied"] = False
-            protected_result.metadata["liquid_recovery_reason"] = "no-surface-region"
-            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
-            return protected_result
+            return mark_not_applied("no-surface-region", alignment=alignment_method)
 
         source_array = np.asarray(aligned_source.convert("RGB"), dtype=np.float32)
         raw_array = np.asarray(raw_generated, dtype=np.float32)
@@ -1975,10 +2501,7 @@ class FaceIdentityMasker:
         region_sheen = new_sheen[region_bool]
         region_highlight = local_highlight[region_bool]
         if region_detail.size < 32:
-            protected_result.metadata["liquid_recovery_applied"] = False
-            protected_result.metadata["liquid_recovery_reason"] = "surface-region-too-small"
-            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
-            return protected_result
+            return mark_not_applied("surface-region-too-small", alignment=alignment_method)
 
         detail_floor = float(max(4.5, np.percentile(region_detail, 80)))
         sheen_floor = float(max(3.0, np.percentile(region_sheen, 76)))
@@ -1991,6 +2514,11 @@ class FaceIdentityMasker:
                 & (new_detail >= detail_floor * 0.75)
             )
         )
+        if allow_color_effects:
+            color_delta = np.mean(np.abs(raw_low - protected_low), axis=2)
+            region_color = color_delta[region_bool]
+            color_floor = float(max(3.0, np.percentile(region_color, 74)))
+            candidate = candidate | (region_bool & (color_delta >= color_floor) & (new_detail >= detail_floor * 0.55))
 
         candidate_mask = Image.fromarray((candidate.astype(np.uint8) * 255), mode="L")
         candidate_mask = _expand_mask(
@@ -1998,23 +2526,22 @@ class FaceIdentityMasker:
             expand_px=max(1, int(base / 560)),
             blur_radius=max(1.4, base / 380.0),
         )
-        candidate_mask = _intersect_masks(candidate_mask, _expand_mask(liquid_region, 0, max(1.0, base / 480.0)))
+        candidate_mask = _intersect_masks(candidate_mask, _expand_mask(effect_region, 0, max(1.0, base / 480.0)))
         candidate_bool = np.asarray(candidate_mask, dtype=np.uint8) > 0
         if not bool(candidate_bool.any()):
-            protected_result.metadata["liquid_recovery_applied"] = False
-            protected_result.metadata["liquid_recovery_reason"] = "no-liquid-delta-detected"
-            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
-            return protected_result
+            return mark_not_applied("no-surface-delta-detected", alignment=alignment_method)
 
         clamped_strength = float(np.clip(protected_result.metadata.get("strength", 0.86), 0.0, 1.0))
         broad_sheen = _uses_broad_surface_sheen(prompt)
         detail_strength = 0.78 + (0.14 * clamped_strength)
         sheen_strength = (0.32 if broad_sheen else 0.18) + (0.12 * clamped_strength)
+        color_strength = (0.18 if allow_color_effects else 0.0) + (0.08 * clamped_strength if allow_color_effects else 0.0)
         alpha = _mask_to_array(candidate_mask)
         raw_detail = raw_array - raw_low
         protected_detail = protected_array - protected_low
         detail_transfer = raw_detail - protected_detail
         sheen_transfer = np.clip(raw_low - protected_low, 0.0, 255.0)
+        color_transfer = raw_low - protected_low
         recovered = np.clip(
             protected_array
             + (detail_transfer * alpha * detail_strength)
@@ -2022,34 +2549,49 @@ class FaceIdentityMasker:
             0,
             255,
         )
+        if allow_color_effects and color_strength > 0.0:
+            recovered = np.clip(recovered + (color_transfer * alpha * color_strength), 0, 255)
 
         metadata = dict(protected_result.metadata)
+        metadata["surface_effect_recovery_applied"] = True
+        metadata["surface_effect_recovery_reason"] = "surface-detail-transfer"
+        metadata["surface_effect_recovery_alignment_method"] = alignment_method
+        metadata["surface_effect_recovery_mask_coverage"] = round(float(candidate_bool.mean()), 4)
+        metadata["surface_effect_recovery_detail_strength"] = round(detail_strength, 3)
+        metadata["surface_effect_recovery_sheen_strength"] = round(sheen_strength, 3)
+        metadata["surface_effect_recovery_color_strength"] = round(color_strength, 3)
+        metadata["surface_effect_terms"] = effect_terms
         metadata["liquid_recovery_applied"] = True
         metadata["liquid_recovery_reason"] = "surface-detail-transfer"
         metadata["liquid_recovery_alignment_method"] = alignment_method
         metadata["liquid_recovery_mask_coverage"] = round(float(candidate_bool.mean()), 4)
         metadata["liquid_recovery_detail_strength"] = round(detail_strength, 3)
         metadata["liquid_recovery_sheen_strength"] = round(sheen_strength, 3)
+        metadata["liquid_recovery_color_strength"] = round(color_strength, 3)
         if parser_face is not None and parser_face.score is not None:
+            metadata["surface_effect_recovery_parser_score"] = parser_face.score
             metadata["liquid_recovery_parser_score"] = parser_face.score
 
         debug_images = dict(protected_result.debug_images)
         if debug:
-            debug_images["mask_liquid_region"] = liquid_region.convert("L")
-            debug_images["mask_liquid_recovery"] = candidate_mask.convert("L")
-            debug_images["overlay_liquid_recovery"] = _overlay_regions(
+            debug_images["mask_surface_effect_region"] = effect_region.convert("L")
+            debug_images["mask_surface_effect_recovery"] = candidate_mask.convert("L")
+            debug_images["overlay_surface_effect_recovery"] = _overlay_regions(
                 raw_generated,
                 {
-                    "surface": liquid_region,
+                    "surface": effect_region,
                     "core": candidate_mask,
                 },
             )
+            debug_images["mask_liquid_region"] = effect_region.convert("L")
+            debug_images["mask_liquid_recovery"] = candidate_mask.convert("L")
+            debug_images["overlay_liquid_recovery"] = debug_images["overlay_surface_effect_recovery"]
 
         return FaceMaskResult(
             image=Image.fromarray(recovered.astype(np.uint8), mode="RGB"),
             applied=protected_result.applied,
             mode=protected_result.mode,
-            reason=f"{protected_result.reason}; liquid-recovery",
+            reason=f"{protected_result.reason}; {effect_label}-recovery",
             engine=protected_result.engine,
             metadata=metadata,
             debug_images=debug_images,
@@ -2078,7 +2620,7 @@ class FaceIdentityMasker:
         )
         result.metadata.setdefault("strategy_requested", "strict_identity")
 
-        if _is_liquid_request(prompt):
+        if _requests_surface_effect(prompt):
             result = self._apply_liquid_surface_recovery(
                 source_image=source_image,
                 generated_image=generated_image,
@@ -2087,6 +2629,9 @@ class FaceIdentityMasker:
                 debug=debug,
             )
         else:
+            result.metadata.setdefault("surface_effect_recovery_applied", False)
+            result.metadata.setdefault("surface_effect_recovery_reason", "not-requested")
+            result.metadata.setdefault("surface_effect_terms", [])
             result.metadata.setdefault("liquid_recovery_applied", False)
             result.metadata.setdefault("liquid_recovery_reason", "not-requested")
 

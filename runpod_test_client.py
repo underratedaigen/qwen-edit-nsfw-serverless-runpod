@@ -411,7 +411,7 @@ def run_inference(
             f"Generated: {generated_resolution_text}\n"
             f"Delivered: {delivered_resolution_text}\n"
             f"Identity drift: {first_drift.get('score', 'n/a')}\n"
-            f"Liquid recovery: {'used' if first_mask.get('liquid_recovery_applied') else first_mask.get('liquid_recovery_reason', 'not requested')}\n"
+            f"Surface effects: {'used' if first_mask.get('surface_effect_recovery_applied') else first_mask.get('surface_effect_recovery_reason', first_mask.get('liquid_recovery_reason', 'not requested'))}\n"
             f"Face coverage: {generation.get('face_coverage', 'n/a')}\n"
             f"Attempts: {attempt_count}\n"
             f"Delay: {result.get('delayTime', 'n/a')} ms\n"
@@ -429,7 +429,7 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
     gr.Markdown("# Runpod Qwen Image Test Client")
     gr.Markdown(
         "Upload one image, enter a prompt, and test your Runpod endpoint. "
-        "The worker now uses a strict identity-lock path, optional liquid-detail recovery for wet or droplet prompts, "
+        "The worker now uses a strict identity-lock path, source-dominant face reinforcement, optional face-surface recovery for wet or makeup-style prompts, "
         "adaptive quality planning, and debug masks."
     )
 
