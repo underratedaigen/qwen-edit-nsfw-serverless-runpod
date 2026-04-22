@@ -110,6 +110,8 @@ IDENTITY_LOCK_INSTRUCTION = (
     "expression lines, hairstyle, or hairline framing around the face. "
     "Unless the user explicitly requests a face-expression change, preserve mouth closure versus open-mouth state, tooth visibility, "
     "eyelid openness, eyebrow spacing, forehead proportions, and the original neutral or subtle expression exactly. "
+    "Unless the user explicitly requests a pose, head-angle, gaze, or framing change, preserve the original head tilt, face angle, gaze direction, "
+    "and asymmetrical facial presentation exactly. Do not frontalize, re-center, or straighten the face by default. "
     "Do not beautify, idealize, symmetrize, smooth, or improve the face unless the user explicitly requests a face-surface effect. "
     "Keep the face aligned, natural, and unchanged even if the user prompt requests otherwise."
 )
@@ -120,7 +122,8 @@ IDENTITY_LOCK_NEGATIVE_PROMPT = (
     "altered cheekbones, altered skin texture, altered hairline, altered hairstyle, de-aged face, aged face, "
     "beautified face, retouched face, distorted face, malformed face, duplicated face, smoothed skin, airbrushed skin, "
     "idealized face, symmetrical face, corrected asymmetry, reshaped face, slimmer face, larger eyes, smaller nose, fuller lips, "
-    "toothy smile, big smile, forced smile, opened mouth, visible teeth, squinting eyes, narrowed eyes, raised eyebrows"
+    "toothy smile, big smile, forced smile, opened mouth, visible teeth, squinting eyes, narrowed eyes, raised eyebrows, "
+    "front-facing face, straightened head, centered face, frontalized face, changed head tilt, changed gaze direction"
 )
 
 COMPOSITION_LOCK_INSTRUCTION = (
@@ -1347,6 +1350,7 @@ class QwenRunpodService:
         self,
         source_image: Image.Image,
         generated_images: Sequence[Image.Image],
+        prompt: str | None = None,
     ) -> List[Dict[str, Any]]:
         masker = self._get_face_masker()
         if masker is False:
@@ -1355,7 +1359,7 @@ class QwenRunpodService:
         assessments: List[Dict[str, Any]] = []
         for image in generated_images:
             try:
-                assessments.append(masker.assess_identity_drift(source_image, image))
+                assessments.append(masker.assess_identity_drift(source_image, image, prompt=prompt))
             except Exception as exc:
                 assessments.append({"available": False, "reason": f"assessment-failed:{exc}"})
         return assessments
@@ -1789,7 +1793,7 @@ class QwenRunpodService:
             debug_mask_payloads = [{} for _ in output_images]
 
         identity_drift = (
-            self._assess_identity_drift(images[0], output_images)
+            self._assess_identity_drift(images[0], output_images, prompt=resolved_prompt)
             if images
             else [{"available": False, "reason": "no-source-image"} for _ in output_images]
         )
