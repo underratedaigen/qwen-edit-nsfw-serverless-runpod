@@ -108,6 +108,8 @@ IDENTITY_LOCK_INSTRUCTION = (
     "Do not change head shape, face width or height ratio, jawline, cheek volume, asymmetry, smile geometry, teeth spacing, "
     "eye shape, eye squint, eye color, eyebrow shape, nose shape, lip shape, skin tone, natural skin texture, wrinkles, folds, "
     "expression lines, hairstyle, or hairline framing around the face. "
+    "Unless the user explicitly requests a face-expression change, preserve mouth closure versus open-mouth state, tooth visibility, "
+    "eyelid openness, eyebrow spacing, forehead proportions, and the original neutral or subtle expression exactly. "
     "Do not beautify, idealize, symmetrize, smooth, or improve the face unless the user explicitly requests a face-surface effect. "
     "Keep the face aligned, natural, and unchanged even if the user prompt requests otherwise."
 )
@@ -117,7 +119,8 @@ IDENTITY_LOCK_NEGATIVE_PROMPT = (
     "modified facial features, altered eyes, altered eyebrows, altered nose, altered lips, altered jawline, "
     "altered cheekbones, altered skin texture, altered hairline, altered hairstyle, de-aged face, aged face, "
     "beautified face, retouched face, distorted face, malformed face, duplicated face, smoothed skin, airbrushed skin, "
-    "idealized face, symmetrical face, corrected asymmetry, reshaped face, slimmer face, larger eyes, smaller nose, fuller lips"
+    "idealized face, symmetrical face, corrected asymmetry, reshaped face, slimmer face, larger eyes, smaller nose, fuller lips, "
+    "toothy smile, big smile, forced smile, opened mouth, visible teeth, squinting eyes, narrowed eyes, raised eyebrows"
 )
 
 COMPOSITION_LOCK_INSTRUCTION = (

@@ -243,6 +243,68 @@ SURFACE_EFFECT_COLOR_HINTS = (
     "freckles",
 )
 
+FACE_EXPRESSION_CHANGE_HINTS = (
+    "smile",
+    "smiling",
+    "grin",
+    "grinning",
+    "laugh",
+    "laughing",
+    "smirk",
+    "pout",
+    "pouty",
+    "frown",
+    "sad expression",
+    "happy expression",
+    "angry expression",
+    "surprised",
+    "surprised expression",
+    "wink",
+    "winking",
+    "open mouth",
+    "mouth open",
+    "show teeth",
+    "toothy smile",
+    "visible teeth",
+    "teeth showing",
+    "eyes closed",
+    "close eyes",
+    "closed eyes",
+    "squint",
+    "squinting",
+    "raise eyebrows",
+    "raised eyebrows",
+    "arched brows",
+    "arch eyebrows",
+)
+
+FACE_STRUCTURE_CHANGE_HINTS = (
+    "change face",
+    "different face",
+    "reshape face",
+    "facial features",
+    "face shape",
+    "jawline",
+    "chin shape",
+    "cheekbones",
+    "cheek volume",
+    "forehead",
+    "hairline",
+    "eyebrow shape",
+    "brow shape",
+    "brow spacing",
+    "eye shape",
+    "nose shape",
+    "lip shape",
+    "bigger lips",
+    "fuller lips",
+    "smaller nose",
+    "larger eyes",
+    "smaller eyes",
+    "narrower face",
+    "wider face",
+)
+
 
 def _connection_ids(connections: Iterable[tuple[int, int]]) -> list[int]:
     ids: set[int] = set()
@@ -620,6 +682,20 @@ def _uses_color_surface_effects(prompt: str | None) -> bool:
     if not normalized:
         return False
     return any(term in normalized for term in SURFACE_EFFECT_COLOR_HINTS)
+
+
+def _requests_face_expression_change(prompt: str | None) -> bool:
+    normalized = _normalize_prompt(prompt)
+    if not normalized:
+        return False
+    return any(term in normalized for term in FACE_EXPRESSION_CHANGE_HINTS)
+
+
+def _requests_face_structure_change(prompt: str | None) -> bool:
+    normalized = _normalize_prompt(prompt)
+    if not normalized:
+        return False
+    return any(term in normalized for term in FACE_STRUCTURE_CHANGE_HINTS)
 
 
 def _detect_exposed_skin_mask(image: Image.Image) -> Image.Image:
@@ -1366,13 +1442,17 @@ class FaceIdentityMasker:
         face_mask: Image.Image,
         core_mask: Image.Image,
         contour_mask: Image.Image,
+        hairline_mask: Image.Image | None = None,
     ) -> Dict[str, Image.Image]:
         empty = Image.new("L", size, 0)
         bbox = self._face_bbox(landmarks)
         if bbox is None:
             return {
+                "eye_lids": empty,
                 "eyes": empty,
+                "mouth": empty,
                 "smile": empty,
+                "brow_forehead": empty,
                 "jaw_cheeks": empty,
                 "expression": empty,
             }
@@ -1384,19 +1464,64 @@ class FaceIdentityMasker:
         face_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
         left_eye = _mean_point([landmarks[index] for index in LEFT_EYE_CENTER_INDICES])
         right_eye = _mean_point([landmarks[index] for index in RIGHT_EYE_CENTER_INDICES])
+        left_brow = _mean_point([landmarks[index] for index in self._left_brow_ids])
+        right_brow = _mean_point([landmarks[index] for index in self._right_brow_ids])
         eye_center = ((left_eye[0] + right_eye[0]) / 2.0, (left_eye[1] + right_eye[1]) / 2.0)
         mouth_left = landmarks[MOUTH_CORNER_LEFT_INDEX]
         mouth_right = landmarks[MOUTH_CORNER_RIGHT_INDEX]
         mouth_center = ((mouth_left[0] + mouth_right[0]) / 2.0, (mouth_left[1] + mouth_right[1]) / 2.0)
 
-        eye_mask = self._mask_from_indices(
+        eye_lid_mask = self._mask_from_indices(
             size,
             landmarks,
             [
-                [*self._left_eye_ids, *self._left_brow_ids],
-                [*self._right_eye_ids, *self._right_brow_ids],
+                self._left_eye_ids,
+                self._right_eye_ids,
             ],
             blur_radius=max(2.0, base / 260.0),
+        )
+        eye_lid_mask = _union_masks(
+            eye_lid_mask,
+            _mask_from_ellipse(
+                size,
+                center=left_eye,
+                radius_x=face_width * 0.14,
+                radius_y=face_height * 0.1,
+                blur_radius=max(1.6, base / 260.0),
+            ),
+            _mask_from_ellipse(
+                size,
+                center=right_eye,
+                radius_x=face_width * 0.14,
+                radius_y=face_height * 0.1,
+                blur_radius=max(1.6, base / 260.0),
+            ),
+        )
+        eye_lid_mask = _expand_mask(
+            eye_lid_mask,
+            expand_px=max(1, int(base / 320)),
+            blur_radius=max(1.6, base / 280.0),
+        )
+        eye_lid_mask = _intersect_masks(eye_lid_mask, face_mask)
+
+        brow_mask = self._mask_from_indices(
+            size,
+            landmarks,
+            [
+                self._left_brow_ids,
+                self._right_brow_ids,
+            ],
+            blur_radius=max(1.8, base / 280.0),
+        )
+        brow_mask = _expand_mask(
+            brow_mask,
+            expand_px=max(1, int(base / 340)),
+            blur_radius=max(1.5, base / 300.0),
+        )
+
+        eye_mask = _union_masks(
+            eye_lid_mask,
+            brow_mask,
         )
         eye_mask = _union_masks(
             eye_mask,
@@ -1415,7 +1540,7 @@ class FaceIdentityMasker:
         )
         eye_mask = _intersect_masks(eye_mask, face_mask)
 
-        smile_mask = self._mask_from_indices(
+        mouth_mask = self._mask_from_indices(
             size,
             landmarks,
             [
@@ -1424,22 +1549,51 @@ class FaceIdentityMasker:
             ],
             blur_radius=max(2.0, base / 260.0),
         )
-        smile_mask = _union_masks(
-            smile_mask,
+        mouth_mask = _union_masks(
+            mouth_mask,
             _mask_from_ellipse(
                 size,
                 center=(mouth_center[0], mouth_center[1] - (0.015 * face_height)),
-                radius_x=face_width * 0.34,
-                radius_y=face_height * 0.21,
+                radius_x=face_width * 0.36,
+                radius_y=face_height * 0.23,
                 blur_radius=max(2.0, base / 220.0),
             ),
         )
-        smile_mask = _expand_mask(
-            smile_mask,
+        mouth_mask = _expand_mask(
+            mouth_mask,
             expand_px=max(2, int(base / 240)),
             blur_radius=max(2.0, base / 240.0),
         )
-        smile_mask = _intersect_masks(smile_mask, face_mask)
+        mouth_mask = _intersect_masks(mouth_mask, face_mask)
+
+        forehead_mask = _mask_from_ellipse(
+            size,
+            center=(face_center[0], y1 + (0.24 * face_height)),
+            radius_x=face_width * 0.46,
+            radius_y=face_height * 0.22,
+            blur_radius=max(2.0, base / 220.0),
+        )
+        forehead_mask = _union_masks(
+            forehead_mask,
+            _mask_from_ellipse(
+                size,
+                center=((left_brow[0] + right_brow[0]) / 2.0, ((left_brow[1] + right_brow[1]) / 2.0) - (0.02 * face_height)),
+                radius_x=face_width * 0.4,
+                radius_y=face_height * 0.16,
+                blur_radius=max(1.8, base / 240.0),
+            ),
+            brow_mask,
+        )
+        allowed_forehead = face_mask
+        if hairline_mask is not None:
+            expanded_hairline = _expand_mask(
+                hairline_mask,
+                expand_px=max(1, int(base / 320)),
+                blur_radius=max(1.8, base / 280.0),
+            )
+            forehead_mask = _union_masks(forehead_mask, expanded_hairline)
+            allowed_forehead = _union_masks(face_mask, expanded_hairline)
+        brow_forehead_mask = _intersect_masks(forehead_mask, allowed_forehead)
 
         jaw_cheek_mask = _mask_from_ellipse(
             size,
@@ -1451,12 +1605,15 @@ class FaceIdentityMasker:
         jaw_cheek_mask = _union_masks(jaw_cheek_mask, contour_mask)
         jaw_cheek_mask = _intersect_masks(jaw_cheek_mask, face_mask)
 
-        expression_mask = _union_masks(eye_mask, smile_mask, jaw_cheek_mask, core_mask)
+        expression_mask = _union_masks(eye_mask, mouth_mask, brow_forehead_mask, jaw_cheek_mask, core_mask)
         expression_mask = _intersect_masks(expression_mask, face_mask)
 
         return {
+            "eye_lids": eye_lid_mask,
             "eyes": eye_mask,
-            "smile": smile_mask,
+            "mouth": mouth_mask,
+            "smile": mouth_mask,
+            "brow_forehead": brow_forehead_mask,
             "jaw_cheeks": jaw_cheek_mask,
             "expression": expression_mask,
         }
@@ -1467,6 +1624,7 @@ class FaceIdentityMasker:
         generated_image: Image.Image,
         protected_result: FaceMaskResult,
         strength: float,
+        prompt: str | None,
         debug: bool,
     ) -> FaceMaskResult:
         if not protected_result.applied:
@@ -1478,6 +1636,9 @@ class FaceIdentityMasker:
         raw_generated = generated_image.convert("RGB")
         base = max(protected_image.size)
         clamped_strength = float(np.clip(strength, 0.0, 1.0))
+        expression_change_requested = _requests_face_expression_change(prompt)
+        structure_change_requested = _requests_face_structure_change(prompt)
+        surface_effect_requested = _requests_surface_effect(prompt)
 
         aligned_source, source_landmarks, protected_landmarks, alignment_method = self._align_source_to_generated(
             source_image,
@@ -1547,12 +1708,66 @@ class FaceIdentityMasker:
             face_mask=face_mask,
             core_mask=core_mask,
             contour_mask=contour_mask,
+            hairline_mask=hairline_mask,
         )
 
         full_face_mask = _union_masks(face_mask, face_shape_mask, expression_masks["jaw_cheeks"])
         structure_mask = _union_masks(core_mask, expression_masks["expression"], face_shape_inner_mask)
         surface_structure_mask = _union_masks(surface_mask, remainder_mask, expression_masks["jaw_cheeks"])
         full_face_inner_mask = _union_masks(structure_mask, face_shape_inner_mask)
+
+        source_signature = self._feature_geometry_signature(source_landmarks)
+        protected_signature = self._feature_geometry_signature(protected_landmarks)
+        mouth_state_drift = 0.0
+        eye_state_drift = 0.0
+        brow_forehead_drift = 0.0
+        face_structure_drift = 0.0
+        source_closed_mouth = False
+        if source_signature is not None and protected_signature is not None:
+            source_eye_open = (source_signature["left_eye_open"] + source_signature["right_eye_open"]) / 2.0
+            protected_eye_open = (protected_signature["left_eye_open"] + protected_signature["right_eye_open"]) / 2.0
+            mouth_state_drift = float(
+                max(
+                    0.0,
+                    (protected_signature["mouth_open"] - source_signature["mouth_open"]) / 0.016,
+                    (protected_signature["mouth_span"] - source_signature["mouth_span"]) / 0.04,
+                    abs(protected_signature["mouth_tilt"] - source_signature["mouth_tilt"]) / 0.018,
+                )
+            )
+            eye_state_drift = float(
+                max(
+                    0.0,
+                    (source_eye_open - protected_eye_open) / 0.012,
+                )
+            )
+            brow_forehead_drift = float(
+                max(
+                    abs(protected_signature["brow_span"] - source_signature["brow_span"]) / 0.03,
+                    abs(protected_signature["left_brow_to_eye"] - source_signature["left_brow_to_eye"]) / 0.016,
+                    abs(protected_signature["right_brow_to_eye"] - source_signature["right_brow_to_eye"]) / 0.016,
+                    abs(protected_signature["forehead_margin"] - source_signature["forehead_margin"]) / 0.026,
+                )
+            )
+            face_structure_drift = float(
+                max(
+                    abs(
+                        math.log(
+                            max(protected_signature["face_aspect_ratio"], 1e-6)
+                            / max(source_signature["face_aspect_ratio"], 1e-6)
+                        )
+                    )
+                    / 0.045,
+                    abs(protected_signature["eye_to_mouth"] - source_signature["eye_to_mouth"]) / 0.028,
+                    abs(protected_signature["nose_to_mouth"] - source_signature["nose_to_mouth"]) / 0.024,
+                )
+            )
+            source_closed_mouth = source_signature["mouth_open"] <= 0.018
+
+        if surface_effect_requested and not expression_change_requested and not structure_change_requested:
+            mouth_state_drift += 0.12
+            eye_state_drift += 0.08
+            brow_forehead_drift += 0.08
+            face_structure_drift += 0.08
 
         source_array = np.asarray(aligned_source.convert("RGB"), dtype=np.float32)
         shape_locked_source_array = np.asarray(shape_locked_source.convert("RGB"), dtype=np.float32)
@@ -1564,36 +1779,86 @@ class FaceIdentityMasker:
         tone_reference = np.clip((shape_locked_source_array * 0.72) + (source_array * 0.28), 0, 255)
 
         final = protected_array.copy()
-        low_freq_alpha = _mask_to_array(full_face_mask) * (0.64 + (0.2 * clamped_strength))
+        base_low_freq_strength = 0.74 if not structure_change_requested else 0.58
+        low_freq_strength = min(1.0, base_low_freq_strength + (0.16 * clamped_strength) + (0.08 * min(face_structure_drift, 1.0)))
+        low_freq_alpha = _mask_to_array(full_face_mask) * low_freq_strength
         if float(low_freq_alpha.max()) > 0.0:
             final_low = _blur_rgb_array(final, radius=max(10.0, base / 72.0))
             source_low = _blur_rgb_array(tone_reference, radius=max(10.0, base / 72.0))
             final = np.clip(final + ((source_low - final_low) * low_freq_alpha), 0, 255)
 
-        hairline_alpha = _mask_to_array(hairline_mask) * (0.66 + (0.16 * clamped_strength))
+        hairline_alpha = _mask_to_array(hairline_mask) * min(1.0, 0.74 + (0.12 * clamped_strength) + (0.08 * min(brow_forehead_drift, 1.0)))
         if float(hairline_alpha.max()) > 0.0:
             hairline_source = np.clip((source_array * 0.97) + (protected_array * 0.03), 0, 255)
             final = (final * (1.0 - hairline_alpha)) + (hairline_source * hairline_alpha)
 
-        full_face_alpha = _mask_to_array(full_face_mask) * (0.58 + (0.18 * clamped_strength))
+        base_full_face_strength = 0.68 if not structure_change_requested else 0.5
+        full_face_strength = min(1.0, base_full_face_strength + (0.16 * clamped_strength) + (0.1 * min(face_structure_drift, 1.0)))
+        full_face_alpha = _mask_to_array(full_face_mask) * full_face_strength
         if float(full_face_alpha.max()) > 0.0:
             full_face_blend = np.clip((full_face_source * 0.992) + (protected_array * 0.008), 0, 255)
             final = (final * (1.0 - full_face_alpha)) + (full_face_blend * full_face_alpha)
 
-        surface_alpha = _mask_to_array(surface_structure_mask) * (0.74 + (0.14 * clamped_strength))
+        surface_alpha = _mask_to_array(surface_structure_mask) * min(
+            1.0,
+            (0.8 if not structure_change_requested else 0.6) + (0.12 * clamped_strength) + (0.08 * min(face_structure_drift, 1.0)),
+        )
         if float(surface_alpha.max()) > 0.0:
             surface_blend = np.clip((full_face_source * 0.986) + (protected_array * 0.014), 0, 255)
             final = (final * (1.0 - surface_alpha)) + (surface_blend * surface_alpha)
 
-        expression_alpha = _mask_to_array(expression_masks["expression"]) * (0.86 + (0.12 * clamped_strength))
+        expression_alpha = _mask_to_array(expression_masks["expression"]) * min(
+            1.0,
+            (0.94 if not expression_change_requested else 0.56) + (0.08 * clamped_strength),
+        )
         if float(expression_alpha.max()) > 0.0:
             expression_blend = np.clip((feature_source * 0.996) + (raw_array * 0.004), 0, 255)
             final = (final * (1.0 - expression_alpha)) + (expression_blend * expression_alpha)
 
-        structure_alpha = _mask_to_array(structure_mask) * min(1.0, 0.94 + (0.08 * clamped_strength))
+        structure_alpha = _mask_to_array(structure_mask) * min(
+            1.0,
+            (0.97 if not expression_change_requested and not structure_change_requested else 0.72) + (0.06 * clamped_strength),
+        )
         if float(structure_alpha.max()) > 0.0:
             structure_blend = np.clip((feature_source * 0.998) + (raw_array * 0.002), 0, 255)
             final = (final * (1.0 - structure_alpha)) + (structure_blend * structure_alpha)
+
+        mouth_lock_strength = (0.985 if not expression_change_requested else 0.5) + (0.04 * clamped_strength) + (0.1 * min(mouth_state_drift, 1.0))
+        if source_closed_mouth and not expression_change_requested:
+            mouth_lock_strength = max(mouth_lock_strength, 0.995)
+        mouth_alpha = _mask_to_array(expression_masks["mouth"]) * min(1.0, mouth_lock_strength)
+        if float(mouth_alpha.max()) > 0.0:
+            mouth_blend = np.clip((feature_source * 0.999) + (protected_array * 0.001), 0, 255)
+            final = (final * (1.0 - mouth_alpha)) + (mouth_blend * mouth_alpha)
+
+        eye_lock_strength = min(
+            1.0,
+            (0.98 if not expression_change_requested else 0.58) + (0.04 * clamped_strength) + (0.12 * min(eye_state_drift, 1.0)),
+        )
+        eye_alpha = _mask_to_array(expression_masks["eye_lids"]) * eye_lock_strength
+        if float(eye_alpha.max()) > 0.0:
+            eye_blend = np.clip((source_array * 0.999) + (shape_locked_source_array * 0.001), 0, 255)
+            final = (final * (1.0 - eye_alpha)) + (eye_blend * eye_alpha)
+
+        brow_forehead_lock_strength = min(
+            1.0,
+            (0.97 if not expression_change_requested and not structure_change_requested else 0.62)
+            + (0.04 * clamped_strength)
+            + (0.12 * min(brow_forehead_drift, 1.0)),
+        )
+        brow_forehead_alpha = _mask_to_array(expression_masks["brow_forehead"]) * brow_forehead_lock_strength
+        if float(brow_forehead_alpha.max()) > 0.0:
+            brow_forehead_blend = np.clip((source_array * 0.997) + (shape_locked_source_array * 0.003), 0, 255)
+            final = (final * (1.0 - brow_forehead_alpha)) + (brow_forehead_blend * brow_forehead_alpha)
+
+        jaw_lock_strength = min(
+            1.0,
+            (0.95 if not structure_change_requested else 0.6) + (0.04 * clamped_strength) + (0.12 * min(face_structure_drift, 1.0)),
+        )
+        jaw_alpha = _mask_to_array(expression_masks["jaw_cheeks"]) * jaw_lock_strength
+        if float(jaw_alpha.max()) > 0.0:
+            jaw_blend = np.clip((shape_locked_source_array * 0.998) + (source_array * 0.002), 0, 255)
+            final = (final * (1.0 - jaw_alpha)) + (jaw_blend * jaw_alpha)
 
         shape_lock_strength = min(1.0, 0.84 + (0.14 * clamped_strength))
         shape_alpha = _mask_to_array(face_shape_mask) * shape_lock_strength
@@ -1639,6 +1904,13 @@ class FaceIdentityMasker:
         metadata["strict_reinforcement_texture_lock_coverage"] = round(texture_lock_coverage, 4)
         metadata["strict_reinforcement_highlight_coverage"] = round(float((np.asarray(highlight_lock_mask, dtype=np.uint8) > 0).mean()), 4)
         metadata["strict_reinforcement_strength"] = round(clamped_strength, 3)
+        metadata["strict_reinforcement_expression_change_requested"] = expression_change_requested
+        metadata["strict_reinforcement_structure_change_requested"] = structure_change_requested
+        metadata["strict_reinforcement_surface_effect_requested"] = surface_effect_requested
+        metadata["strict_reinforcement_mouth_state_drift"] = round(mouth_state_drift, 4)
+        metadata["strict_reinforcement_eye_state_drift"] = round(eye_state_drift, 4)
+        metadata["strict_reinforcement_brow_forehead_drift"] = round(brow_forehead_drift, 4)
+        metadata["strict_reinforcement_face_structure_drift"] = round(face_structure_drift, 4)
         for key, value in shape_meta.items():
             metadata[f"strict_reinforcement_shape_{key}"] = value
         if parser_face is not None and parser_face.score is not None:
@@ -1651,6 +1923,9 @@ class FaceIdentityMasker:
             debug_images["mask_strict_full_face"] = full_face_mask.convert("L")
             debug_images["mask_strict_expression"] = expression_masks["expression"].convert("L")
             debug_images["mask_strict_structure"] = structure_mask.convert("L")
+            debug_images["mask_strict_mouth"] = expression_masks["mouth"].convert("L")
+            debug_images["mask_strict_eye_lids"] = expression_masks["eye_lids"].convert("L")
+            debug_images["mask_strict_brow_forehead"] = expression_masks["brow_forehead"].convert("L")
             debug_images["mask_strict_hairline"] = hairline_mask.convert("L")
             debug_images["overlay_strict_identity"] = _overlay_regions(
                 protected_image,
@@ -1721,6 +1996,8 @@ class FaceIdentityMasker:
         face_height = max(1.0, y2 - y1)
         left_eye = _mean_point([landmarks[index] for index in LEFT_EYE_CENTER_INDICES])
         right_eye = _mean_point([landmarks[index] for index in RIGHT_EYE_CENTER_INDICES])
+        left_brow = _mean_point([landmarks[index] for index in self._left_brow_ids])
+        right_brow = _mean_point([landmarks[index] for index in self._right_brow_ids])
         nose_tip = landmarks[NOSE_TIP_INDEX]
         mouth_left = landmarks[MOUTH_CORNER_LEFT_INDEX]
         mouth_right = landmarks[MOUTH_CORNER_RIGHT_INDEX]
@@ -1739,6 +2016,10 @@ class FaceIdentityMasker:
             "right_eye_open": abs(landmarks[386][1] - landmarks[374][1]) / face_height,
             "mouth_open": abs(upper_lip[1] - lower_lip[1]) / face_height,
             "mouth_tilt": abs(mouth_left[1] - mouth_right[1]) / face_height,
+            "brow_span": math.dist(left_brow, right_brow) / face_width,
+            "left_brow_to_eye": abs(left_brow[1] - left_eye[1]) / face_height,
+            "right_brow_to_eye": abs(right_brow[1] - right_eye[1]) / face_height,
+            "forehead_margin": max(0.0, eye_center[1] - y1) / face_height,
         }
 
     def assess_identity_drift(
@@ -1837,6 +2118,10 @@ class FaceIdentityMasker:
                 abs(generated_signature["mouth_open"] - source_signature["mouth_open"]) / 0.022,
                 abs(generated_signature["left_eye_open"] - source_signature["left_eye_open"]) / 0.018,
                 abs(generated_signature["right_eye_open"] - source_signature["right_eye_open"]) / 0.018,
+                abs(generated_signature["brow_span"] - source_signature["brow_span"]) / 0.028,
+                abs(generated_signature["left_brow_to_eye"] - source_signature["left_brow_to_eye"]) / 0.016,
+                abs(generated_signature["right_brow_to_eye"] - source_signature["right_brow_to_eye"]) / 0.016,
+                abs(generated_signature["forehead_margin"] - source_signature["forehead_margin"]) / 0.024,
             ]
             feature_error = float(np.mean(np.clip(feature_components, 0.0, 1.0)))
 
@@ -2345,6 +2630,7 @@ class FaceIdentityMasker:
         source_image: Image.Image,
         generated_image: Image.Image,
         strength: float,
+        prompt: str | None,
         debug: bool,
     ) -> FaceMaskResult:
         try:
@@ -2374,6 +2660,7 @@ class FaceIdentityMasker:
                 generated_image=generated_image,
                 protected_result=base_result,
                 strength=strength,
+                prompt=prompt,
                 debug=debug,
             )
         except Exception as exc:
@@ -2616,6 +2903,7 @@ class FaceIdentityMasker:
             source_image=source_image,
             generated_image=generated_image,
             strength=strength,
+            prompt=prompt,
             debug=debug,
         )
         result.metadata.setdefault("strategy_requested", "strict_identity")
