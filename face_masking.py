@@ -150,6 +150,53 @@ POSITION_CHANGE_TARGETS = (
     "position",
 )
 
+LIQUID_HINTS = (
+    "water drop",
+    "water drops",
+    "water droplet",
+    "water droplets",
+    "droplet",
+    "droplets",
+    "water bead",
+    "water beads",
+    "wet",
+    "wet face",
+    "wet skin",
+    "sweat",
+    "sweaty",
+    "sweating",
+    "tear",
+    "tears",
+    "tear streak",
+    "teardrop",
+    "dew",
+    "dewy",
+    "moist",
+    "moisture",
+    "condensation",
+    "fresh from the pool",
+    "just in the pool",
+    "just out of the pool",
+    "pool water",
+    "raindrops",
+    "rain drops",
+)
+
+SHEEN_HINTS = (
+    "wet",
+    "wet face",
+    "wet skin",
+    "sweat",
+    "sweaty",
+    "sweating",
+    "dew",
+    "dewy",
+    "moist",
+    "moisture",
+    "glistening",
+    "shimmer",
+)
+
 
 def _connection_ids(connections: Iterable[tuple[int, int]]) -> list[int]:
     ids: set[int] = set()
@@ -455,6 +502,20 @@ def _position_change_hints(prompt: str | None) -> list[str]:
             seen.add(match)
             ordered.append(match)
     return ordered
+
+
+def _is_liquid_request(prompt: str | None) -> bool:
+    normalized = _normalize_prompt(prompt)
+    if not normalized:
+        return False
+    return any(term in normalized for term in LIQUID_HINTS)
+
+
+def _uses_broad_surface_sheen(prompt: str | None) -> bool:
+    normalized = _normalize_prompt(prompt)
+    if not normalized:
+        return False
+    return any(term in normalized for term in SHEEN_HINTS)
 
 
 def _detect_exposed_skin_mask(image: Image.Image) -> Image.Image:
@@ -1790,6 +1851,210 @@ class FaceIdentityMasker:
             ),
         )
 
+    def _strict_identity_protect(
+        self,
+        source_image: Image.Image,
+        generated_image: Image.Image,
+        strength: float,
+        debug: bool,
+    ) -> FaceMaskResult:
+        try:
+            result = self._smart_protect(
+                source_image=source_image,
+                generated_image=generated_image,
+                mode="strict",
+                strength=strength,
+                debug=debug,
+            )
+            result.metadata.setdefault("fallback", "none")
+            result.metadata.setdefault("base_engine", result.engine)
+        except Exception as exc:
+            result = self._legacy_protect(
+                source_image=source_image,
+                generated_image=generated_image,
+                mode="strict",
+                debug=debug,
+            )
+            result.reason = f"{result.reason}; strict-smart-fallback:{exc}"
+            result.metadata["fallback"] = "legacy"
+            result.metadata["base_engine"] = result.engine
+
+        result.mode = "strict"
+        result.engine = "strict_identity"
+        result.metadata["strategy_used"] = "strict_identity"
+        result.metadata["strict_identity_lock"] = True
+        return result
+
+    def _apply_liquid_surface_recovery(
+        self,
+        source_image: Image.Image,
+        generated_image: Image.Image,
+        protected_result: FaceMaskResult,
+        prompt: str | None,
+        debug: bool,
+    ) -> FaceMaskResult:
+        if not protected_result.applied:
+            protected_result.metadata["liquid_recovery_applied"] = False
+            protected_result.metadata["liquid_recovery_reason"] = "strict-mask-not-applied"
+            return protected_result
+
+        raw_generated = generated_image.convert("RGB")
+        protected_image = protected_result.image.convert("RGB")
+        base = max(raw_generated.size)
+
+        aligned_source, source_landmarks, generated_landmarks, alignment_method = self._align_source_to_generated(
+            source_image,
+            raw_generated,
+        )
+        if not source_landmarks:
+            protected_result.metadata["liquid_recovery_applied"] = False
+            protected_result.metadata["liquid_recovery_reason"] = "no-source-face"
+            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
+            return protected_result
+        if not generated_landmarks:
+            protected_result.metadata["liquid_recovery_applied"] = False
+            protected_result.metadata["liquid_recovery_reason"] = "no-output-face"
+            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
+            return protected_result
+
+        parser_face: ParserFaceData | None = None
+        region_masks: Dict[str, Image.Image] | None = None
+        try:
+            parser_face = self._parse_face_regions(raw_generated)
+            region_masks = self._build_smart_masks(raw_generated.size, generated_landmarks, parser_face)
+            face_mask = _subtract_masks(
+                region_masks["face"],
+                region_masks["hairline"],
+                blur_radius=max(1.0, base / 360.0),
+            )
+            liquid_region = _subtract_masks(
+                _union_masks(region_masks["surface"], region_masks["remainder"], region_masks["contour"]),
+                region_masks["core"],
+                region_masks["hairline"],
+                blur_radius=max(1.2, base / 340.0),
+            )
+        except Exception as exc:
+            parser_face = None
+            face_mask, core_mask, contour_mask = self._build_legacy_masks(raw_generated.size, generated_landmarks)
+            liquid_region = _subtract_masks(
+                _union_masks(face_mask, contour_mask),
+                core_mask,
+                blur_radius=max(1.2, base / 320.0),
+            )
+            protected_result.metadata["liquid_recovery_parser_fallback"] = str(exc)
+
+        liquid_region = _intersect_masks(liquid_region, face_mask)
+        region_bool = np.asarray(liquid_region, dtype=np.uint8) > 0
+        if not bool(region_bool.any()):
+            protected_result.metadata["liquid_recovery_applied"] = False
+            protected_result.metadata["liquid_recovery_reason"] = "no-surface-region"
+            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
+            return protected_result
+
+        source_array = np.asarray(aligned_source.convert("RGB"), dtype=np.float32)
+        raw_array = np.asarray(raw_generated, dtype=np.float32)
+        protected_array = np.asarray(protected_image, dtype=np.float32)
+        blur_radius = max(2.0, base / 220.0)
+        raw_low = _blur_rgb_array(raw_array, blur_radius)
+        source_low = _blur_rgb_array(source_array, blur_radius)
+        protected_low = _blur_rgb_array(protected_array, blur_radius)
+
+        raw_luminance = _luminance_array(raw_array)
+        source_luminance = _luminance_array(source_array)
+        protected_luminance = _luminance_array(protected_array)
+        raw_local_luminance = _luminance_array(raw_low)
+
+        raw_detail_magnitude = np.mean(np.abs(raw_array - raw_low), axis=2)
+        source_detail_magnitude = np.mean(np.abs(source_array - source_low), axis=2)
+        protected_detail_magnitude = np.mean(np.abs(protected_array - protected_low), axis=2)
+        new_detail = np.maximum(raw_detail_magnitude - np.maximum(source_detail_magnitude, protected_detail_magnitude), 0.0)
+        new_sheen = np.maximum(raw_luminance - np.maximum(source_luminance, protected_luminance), 0.0)
+        local_highlight = np.maximum(raw_luminance - raw_local_luminance, 0.0)
+
+        region_detail = new_detail[region_bool]
+        region_sheen = new_sheen[region_bool]
+        region_highlight = local_highlight[region_bool]
+        if region_detail.size < 32:
+            protected_result.metadata["liquid_recovery_applied"] = False
+            protected_result.metadata["liquid_recovery_reason"] = "surface-region-too-small"
+            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
+            return protected_result
+
+        detail_floor = float(max(4.5, np.percentile(region_detail, 80)))
+        sheen_floor = float(max(3.0, np.percentile(region_sheen, 76)))
+        highlight_floor = float(max(3.0, np.percentile(region_highlight, 72)))
+        candidate = region_bool & (
+            ((new_detail >= detail_floor) & (new_sheen >= sheen_floor))
+            | (
+                (local_highlight >= highlight_floor)
+                & (new_sheen >= max(2.0, sheen_floor * 0.65))
+                & (new_detail >= detail_floor * 0.75)
+            )
+        )
+
+        candidate_mask = Image.fromarray((candidate.astype(np.uint8) * 255), mode="L")
+        candidate_mask = _expand_mask(
+            candidate_mask,
+            expand_px=max(1, int(base / 560)),
+            blur_radius=max(1.4, base / 380.0),
+        )
+        candidate_mask = _intersect_masks(candidate_mask, _expand_mask(liquid_region, 0, max(1.0, base / 480.0)))
+        candidate_bool = np.asarray(candidate_mask, dtype=np.uint8) > 0
+        if not bool(candidate_bool.any()):
+            protected_result.metadata["liquid_recovery_applied"] = False
+            protected_result.metadata["liquid_recovery_reason"] = "no-liquid-delta-detected"
+            protected_result.metadata["liquid_recovery_alignment_method"] = alignment_method
+            return protected_result
+
+        clamped_strength = float(np.clip(protected_result.metadata.get("strength", 0.86), 0.0, 1.0))
+        broad_sheen = _uses_broad_surface_sheen(prompt)
+        detail_strength = 0.78 + (0.14 * clamped_strength)
+        sheen_strength = (0.32 if broad_sheen else 0.18) + (0.12 * clamped_strength)
+        alpha = _mask_to_array(candidate_mask)
+        raw_detail = raw_array - raw_low
+        protected_detail = protected_array - protected_low
+        detail_transfer = raw_detail - protected_detail
+        sheen_transfer = np.clip(raw_low - protected_low, 0.0, 255.0)
+        recovered = np.clip(
+            protected_array
+            + (detail_transfer * alpha * detail_strength)
+            + (sheen_transfer * alpha * sheen_strength),
+            0,
+            255,
+        )
+
+        metadata = dict(protected_result.metadata)
+        metadata["liquid_recovery_applied"] = True
+        metadata["liquid_recovery_reason"] = "surface-detail-transfer"
+        metadata["liquid_recovery_alignment_method"] = alignment_method
+        metadata["liquid_recovery_mask_coverage"] = round(float(candidate_bool.mean()), 4)
+        metadata["liquid_recovery_detail_strength"] = round(detail_strength, 3)
+        metadata["liquid_recovery_sheen_strength"] = round(sheen_strength, 3)
+        if parser_face is not None and parser_face.score is not None:
+            metadata["liquid_recovery_parser_score"] = parser_face.score
+
+        debug_images = dict(protected_result.debug_images)
+        if debug:
+            debug_images["mask_liquid_region"] = liquid_region.convert("L")
+            debug_images["mask_liquid_recovery"] = candidate_mask.convert("L")
+            debug_images["overlay_liquid_recovery"] = _overlay_regions(
+                raw_generated,
+                {
+                    "surface": liquid_region,
+                    "core": candidate_mask,
+                },
+            )
+
+        return FaceMaskResult(
+            image=Image.fromarray(recovered.astype(np.uint8), mode="RGB"),
+            applied=protected_result.applied,
+            mode=protected_result.mode,
+            reason=f"{protected_result.reason}; liquid-recovery",
+            engine=protected_result.engine,
+            metadata=metadata,
+            debug_images=debug_images,
+        )
+
     def protect(
         self,
         source_image: Image.Image,
@@ -1800,52 +2065,29 @@ class FaceIdentityMasker:
         prompt: str | None = None,
         debug: bool = False,
     ) -> FaceMaskResult:
-        normalized_mode = (mode or "balanced").strip().lower()
-        normalized_strategy = (strategy or "auto").strip().lower()
+        normalized_mode = (mode or "strict").strip().lower()
 
         if normalized_mode == "off":
             return FaceMaskResult(image=generated_image, applied=False, mode="off", reason="disabled", engine="none")
 
-        if normalized_strategy == "legacy":
-            result = self._legacy_protect(source_image, generated_image, mode=normalized_mode, debug=debug)
-            result.metadata.setdefault("strategy_requested", "legacy")
-            return result
+        result = self._strict_identity_protect(
+            source_image=source_image,
+            generated_image=generated_image,
+            strength=strength,
+            debug=debug,
+        )
+        result.metadata.setdefault("strategy_requested", "strict_identity")
 
-        if normalized_strategy == "preserve_skin":
-            result = self._preserve_skin_protect(
+        if _is_liquid_request(prompt):
+            result = self._apply_liquid_surface_recovery(
                 source_image=source_image,
                 generated_image=generated_image,
-                mode=normalized_mode,
-                strength=strength,
+                protected_result=result,
                 prompt=prompt,
                 debug=debug,
             )
-            result.metadata.setdefault("strategy_requested", "preserve_skin")
-            return result
+        else:
+            result.metadata.setdefault("liquid_recovery_applied", False)
+            result.metadata.setdefault("liquid_recovery_reason", "not-requested")
 
-        try:
-            result = self._smart_protect(
-                source_image=source_image,
-                generated_image=generated_image,
-                mode=normalized_mode,
-                strength=strength,
-                debug=debug,
-            )
-            result.metadata.setdefault("strategy_requested", normalized_strategy)
-            return result
-        except Exception as exc:
-            if normalized_strategy == "smart":
-                return FaceMaskResult(
-                    image=generated_image.convert("RGB"),
-                    applied=False,
-                    mode=normalized_mode,
-                    reason=f"smart-failed:{exc}",
-                    engine="smart",
-                    metadata={"strategy_requested": "smart"},
-                )
-
-            fallback = self._legacy_protect(source_image, generated_image, mode=normalized_mode, debug=debug)
-            fallback.reason = f"{fallback.reason}; smart-fallback:{exc}"
-            fallback.metadata["strategy_requested"] = normalized_strategy
-            fallback.metadata["fallback"] = "legacy"
-            return fallback
+        return result

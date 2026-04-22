@@ -23,9 +23,12 @@ from safetensors.torch import load_file
 RUNPOD_HF_CACHE_ROOT = Path("/runpod-volume/huggingface-cache/hub")
 DEFAULT_OUTPUT_DIR = Path("/tmp/runpod-output")
 MAX_SEED = 2**31 - 1
-DEFAULT_MIN_OUTPUT_LONG_EDGE = 1920
-DEFAULT_MIN_OUTPUT_SHORT_EDGE = 1080
-DEFAULT_MIN_OUTPUT_PIXELS = 1920 * 1080
+DEFAULT_MAX_INPUT_LONG_EDGE = 1920
+DEFAULT_MAX_INPUT_SHORT_EDGE = 1080
+DEFAULT_MAX_INPUT_PIXELS = 1920 * 1080
+DEFAULT_MAX_OUTPUT_LONG_EDGE = 1920
+DEFAULT_MAX_OUTPUT_SHORT_EDGE = 1080
+DEFAULT_MAX_OUTPUT_PIXELS = 1920 * 1080
 DEFAULT_NATIVE_MIN_LONG_EDGE = 1536
 DEFAULT_NATIVE_MIN_SHORT_EDGE = 1216
 DEFAULT_NATIVE_MIN_PIXELS = 1216 * 1792
@@ -33,7 +36,7 @@ DEFAULT_NATIVE_MAX_LONG_EDGE = 2048
 DEFAULT_GENERATION_SIZE_MULTIPLE = 32
 DEFAULT_QUALITY_MODE = "balanced"
 DEFAULT_POSTPROCESS_UPSCALE_MODE = "detail"
-DEFAULT_FACE_MASK_STRATEGY = "smart"
+DEFAULT_FACE_MASK_STRATEGY = "strict_identity"
 DEFAULT_FACE_MASK_STRENGTH = 0.86
 DEFAULT_IDENTITY_DRIFT_THRESHOLD = 0.26
 DEFAULT_IDENTITY_RETRY_GUIDANCE_BOOST = 0.28
@@ -409,11 +412,15 @@ def _normalize_quality_mode(value: Any) -> str:
 
 
 def _normalize_mask_strategy(value: Any) -> str:
-    return _normalize_choice(value, {"auto", "smart", "legacy", "preserve_skin"}, DEFAULT_FACE_MASK_STRATEGY)
+    normalized = str(value or DEFAULT_FACE_MASK_STRATEGY).strip().lower()
+    if normalized in {"off", "none"}:
+        return "off"
+    return DEFAULT_FACE_MASK_STRATEGY
 
 
 def _normalize_mask_mode(value: Any) -> str:
-    return _normalize_choice(value, {"balanced", "strict", "surface_fx", "off"}, "surface_fx")
+    normalized = str(value or "strict").strip().lower()
+    return "off" if normalized == "off" else "strict"
 
 
 def _normalize_upscale_mode(value: Any) -> str:
@@ -530,6 +537,98 @@ def _align_dimension(value: float, multiple: int, round_up: bool = True) -> int:
     return max(multiple, int(rounded) * multiple)
 
 
+def _compute_limit_scale(
+    width: int,
+    height: int,
+    maximum_long_edge: int,
+    maximum_short_edge: int,
+    maximum_pixels: int,
+) -> float:
+    if width <= 0 or height <= 0:
+        return 1.0
+
+    scale = 1.0
+    long_edge = max(width, height)
+    short_edge = min(width, height)
+    area = width * height
+
+    if maximum_long_edge > 0 and long_edge > maximum_long_edge:
+        scale = min(scale, maximum_long_edge / float(long_edge))
+    if maximum_short_edge > 0 and short_edge > maximum_short_edge:
+        scale = min(scale, maximum_short_edge / float(short_edge))
+    if maximum_pixels > 0 and area > maximum_pixels:
+        scale = min(scale, math.sqrt(maximum_pixels / float(area)))
+
+    return min(scale, 1.0)
+
+
+def _resize_image_to_limits(
+    image: Image.Image,
+    maximum_long_edge: int,
+    maximum_short_edge: int,
+    maximum_pixels: int,
+) -> tuple[Image.Image, Dict[str, Any]]:
+    width, height = image.size
+    scale = _compute_limit_scale(
+        width=width,
+        height=height,
+        maximum_long_edge=maximum_long_edge,
+        maximum_short_edge=maximum_short_edge,
+        maximum_pixels=maximum_pixels,
+    )
+    if scale >= 0.9999:
+        return image, {
+            "resized": False,
+            "original_width": width,
+            "original_height": height,
+            "target_width": width,
+            "target_height": height,
+            "scale": 1.0,
+        }
+
+    resized = image.resize(
+        (
+            max(1, int(round(width * scale))),
+            max(1, int(round(height * scale))),
+        ),
+        resample=Image.Resampling.LANCZOS,
+    )
+    return resized, {
+        "resized": True,
+        "original_width": width,
+        "original_height": height,
+        "target_width": resized.width,
+        "target_height": resized.height,
+        "scale": round(scale, 4),
+    }
+
+
+def _cap_generation_dimensions(
+    width: int,
+    height: int,
+    maximum_long_edge: int,
+    maximum_short_edge: int,
+    maximum_pixels: int,
+    size_multiple: int,
+) -> tuple[int, int]:
+    scale = _compute_limit_scale(
+        width=width,
+        height=height,
+        maximum_long_edge=maximum_long_edge,
+        maximum_short_edge=maximum_short_edge,
+        maximum_pixels=maximum_pixels,
+    )
+    if scale >= 0.9999:
+        return max(size_multiple, int(width)), max(size_multiple, int(height))
+
+    capped_width = max(1, int(math.floor(width * scale)))
+    capped_height = max(1, int(math.floor(height * scale)))
+    return (
+        _align_dimension(capped_width, size_multiple, round_up=False),
+        _align_dimension(capped_height, size_multiple, round_up=False),
+    )
+
+
 def _resolve_source_native_size(
     reference_image: Image.Image | None,
     size_multiple: int,
@@ -611,6 +710,8 @@ def _resolve_generation_size(
     minimum_short_edge: int,
     minimum_pixels: int,
     maximum_long_edge: int,
+    maximum_short_edge: int,
+    maximum_pixels: int,
     size_multiple: int,
 ) -> tuple[int, int]:
     aspect_ratio = 1.0
@@ -619,23 +720,35 @@ def _resolve_generation_size(
     aspect_ratio = max(aspect_ratio, 1e-3)
 
     if requested_width and requested_height:
-        return (
-            _align_dimension(requested_width, size_multiple, round_up=True),
-            _align_dimension(requested_height, size_multiple, round_up=True),
+        return _cap_generation_dimensions(
+            width=_align_dimension(requested_width, size_multiple, round_up=True),
+            height=_align_dimension(requested_height, size_multiple, round_up=True),
+            maximum_long_edge=maximum_long_edge,
+            maximum_short_edge=maximum_short_edge,
+            maximum_pixels=maximum_pixels,
+            size_multiple=size_multiple,
         )
 
     if requested_width and not requested_height:
         resolved_height = max(1, int(round(requested_width / aspect_ratio)))
-        return (
-            _align_dimension(requested_width, size_multiple, round_up=True),
-            _align_dimension(resolved_height, size_multiple, round_up=True),
+        return _cap_generation_dimensions(
+            width=_align_dimension(requested_width, size_multiple, round_up=True),
+            height=_align_dimension(resolved_height, size_multiple, round_up=True),
+            maximum_long_edge=maximum_long_edge,
+            maximum_short_edge=maximum_short_edge,
+            maximum_pixels=maximum_pixels,
+            size_multiple=size_multiple,
         )
 
     if requested_height and not requested_width:
         resolved_width = max(1, int(round(requested_height * aspect_ratio)))
-        return (
-            _align_dimension(resolved_width, size_multiple, round_up=True),
-            _align_dimension(requested_height, size_multiple, round_up=True),
+        return _cap_generation_dimensions(
+            width=_align_dimension(resolved_width, size_multiple, round_up=True),
+            height=_align_dimension(requested_height, size_multiple, round_up=True),
+            maximum_long_edge=maximum_long_edge,
+            maximum_short_edge=maximum_short_edge,
+            maximum_pixels=maximum_pixels,
+            size_multiple=size_multiple,
         )
 
     if aspect_ratio >= 1.0:
@@ -669,16 +782,15 @@ def _resolve_generation_size(
     resolved_width = _align_dimension(width, size_multiple, round_up=align_up)
     resolved_height = _align_dimension(height, size_multiple, round_up=align_up)
 
-    if maximum_long_edge > 0:
-        max_aligned_long_edge = _align_dimension(maximum_long_edge, size_multiple, round_up=False)
-        if resolved_width >= resolved_height and resolved_width > max_aligned_long_edge:
-            scale_down = max_aligned_long_edge / resolved_width
-            resolved_width = max_aligned_long_edge
-            resolved_height = _align_dimension(resolved_height * scale_down, size_multiple, round_up=False)
-        elif resolved_height > resolved_width and resolved_height > max_aligned_long_edge:
-            scale_down = max_aligned_long_edge / resolved_height
-            resolved_height = max_aligned_long_edge
-            resolved_width = _align_dimension(resolved_width * scale_down, size_multiple, round_up=False)
+    if maximum_long_edge > 0 or maximum_short_edge > 0 or maximum_pixels > 0:
+        resolved_width, resolved_height = _cap_generation_dimensions(
+            width=resolved_width,
+            height=resolved_height,
+            maximum_long_edge=maximum_long_edge,
+            maximum_short_edge=maximum_short_edge,
+            maximum_pixels=maximum_pixels,
+            size_multiple=size_multiple,
+        )
 
     return resolved_width, resolved_height
 
@@ -701,9 +813,9 @@ def _postprocess_upscaled_image(image: Image.Image, scale: float, upscale_mode: 
 
 def _finalize_output_resolution(
     image: Image.Image,
-    minimum_long_edge: int,
-    minimum_short_edge: int,
-    minimum_pixels: int,
+    maximum_long_edge: int,
+    maximum_short_edge: int,
+    maximum_pixels: int,
     upscale_mode: str,
     exact_output_size: tuple[int, int] | None = None,
 ) -> tuple[Image.Image, Dict[str, Any]]:
@@ -717,7 +829,7 @@ def _finalize_output_resolution(
             if (width, height) != (target_width, target_height):
                 image = image.resize((target_width, target_height), resample=Image.Resampling.LANCZOS)
             return image, {
-                "upscaled": False,
+                "resized": False,
                 "original_width": width,
                 "original_height": height,
                 "matched_source_size": True,
@@ -727,32 +839,24 @@ def _finalize_output_resolution(
                 "upscale_mode": "off",
             }
 
-    long_edge = max(width, height)
-    short_edge = min(width, height)
-    area = width * height
-
-    scale = 1.0
-    if minimum_long_edge > 0 and long_edge < minimum_long_edge:
-        scale = max(scale, minimum_long_edge / long_edge)
-    if minimum_short_edge > 0 and short_edge < minimum_short_edge:
-        scale = max(scale, minimum_short_edge / short_edge)
-    if minimum_pixels > 0 and area < minimum_pixels:
-        scale = max(scale, math.sqrt(minimum_pixels / area))
-
-    if scale <= 1.0:
-        processed, postprocess_meta = _postprocess_upscaled_image(image, scale=1.0, upscale_mode=upscale_mode)
-        return processed, {"upscaled": False, "original_width": width, "original_height": height, **postprocess_meta}
-
-    resized = image.resize(
-        (int(math.ceil(width * scale)), int(math.ceil(height * scale))),
-        resample=Image.Resampling.LANCZOS,
+    capped_image, resize_meta = _resize_image_to_limits(
+        image=image,
+        maximum_long_edge=maximum_long_edge,
+        maximum_short_edge=maximum_short_edge,
+        maximum_pixels=maximum_pixels,
     )
-    processed, postprocess_meta = _postprocess_upscaled_image(resized, scale=scale, upscale_mode=upscale_mode)
+    processed, postprocess_meta = _postprocess_upscaled_image(
+        capped_image,
+        scale=1.0,
+        upscale_mode=upscale_mode,
+    )
     return processed, {
-        "upscaled": True,
+        "resized": resize_meta["resized"],
         "original_width": width,
         "original_height": height,
-        "upscale_scale": round(scale, 4),
+        "target_width": resize_meta["target_width"],
+        "target_height": resize_meta["target_height"],
+        "resize_scale": resize_meta["scale"],
         **postprocess_meta,
     }
 
@@ -907,7 +1011,7 @@ class WorkerConfig:
     default_rewrite_prompt: bool = _to_bool(os.environ.get("DEFAULT_REWRITE_PROMPT"), False)
     lock_face_identity: bool = _to_bool(os.environ.get("LOCK_FACE_IDENTITY"), True)
     face_mask_strategy: str = _normalize_mask_strategy(os.environ.get("FACE_MASK_STRATEGY", DEFAULT_FACE_MASK_STRATEGY))
-    face_mask_mode: str = _normalize_mask_mode(os.environ.get("FACE_MASK_MODE", "surface_fx"))
+    face_mask_mode: str = _normalize_mask_mode(os.environ.get("FACE_MASK_MODE", "strict"))
     face_mask_strength: float = _clamp_float(
         _to_float(os.environ.get("FACE_MASK_STRENGTH"), DEFAULT_FACE_MASK_STRENGTH),
         0.0,
@@ -955,21 +1059,41 @@ class WorkerConfig:
         os.environ.get("MAX_NATIVE_LONG_EDGE"),
         DEFAULT_NATIVE_MAX_LONG_EDGE,
     )
+    maximum_native_short_edge: int = _to_int(
+        os.environ.get("MAX_NATIVE_SHORT_EDGE"),
+        DEFAULT_MAX_INPUT_SHORT_EDGE,
+    )
+    maximum_native_pixels: int = _to_int(
+        os.environ.get("MAX_NATIVE_PIXELS"),
+        DEFAULT_MAX_INPUT_PIXELS,
+    )
     generation_size_multiple: int = _to_int(
         os.environ.get("GENERATION_SIZE_MULTIPLE"),
         DEFAULT_GENERATION_SIZE_MULTIPLE,
     )
-    minimum_output_long_edge: int = _to_int(
-        os.environ.get("MIN_OUTPUT_LONG_EDGE"),
-        DEFAULT_MIN_OUTPUT_LONG_EDGE,
+    maximum_input_long_edge: int = _to_int(
+        os.environ.get("MAX_INPUT_LONG_EDGE"),
+        DEFAULT_MAX_INPUT_LONG_EDGE,
     )
-    minimum_output_short_edge: int = _to_int(
-        os.environ.get("MIN_OUTPUT_SHORT_EDGE"),
-        DEFAULT_MIN_OUTPUT_SHORT_EDGE,
+    maximum_input_short_edge: int = _to_int(
+        os.environ.get("MAX_INPUT_SHORT_EDGE"),
+        DEFAULT_MAX_INPUT_SHORT_EDGE,
     )
-    minimum_output_pixels: int = _to_int(
-        os.environ.get("MIN_OUTPUT_PIXELS"),
-        DEFAULT_MIN_OUTPUT_PIXELS,
+    maximum_input_pixels: int = _to_int(
+        os.environ.get("MAX_INPUT_PIXELS"),
+        DEFAULT_MAX_INPUT_PIXELS,
+    )
+    maximum_output_long_edge: int = _to_int(
+        os.environ.get("MAX_OUTPUT_LONG_EDGE"),
+        _to_int(os.environ.get("MIN_OUTPUT_LONG_EDGE"), DEFAULT_MAX_OUTPUT_LONG_EDGE),
+    )
+    maximum_output_short_edge: int = _to_int(
+        os.environ.get("MAX_OUTPUT_SHORT_EDGE"),
+        _to_int(os.environ.get("MIN_OUTPUT_SHORT_EDGE"), DEFAULT_MAX_OUTPUT_SHORT_EDGE),
+    )
+    maximum_output_pixels: int = _to_int(
+        os.environ.get("MAX_OUTPUT_PIXELS"),
+        _to_int(os.environ.get("MIN_OUTPUT_PIXELS"), DEFAULT_MAX_OUTPUT_PIXELS),
     )
     postprocess_upscale_mode: str = _normalize_upscale_mode(
         os.environ.get("POSTPROCESS_UPSCALE_MODE", DEFAULT_POSTPROCESS_UPSCALE_MODE)
@@ -1422,9 +1546,9 @@ class QwenRunpodService:
         for index, image in enumerate(images):
             image, output_resolution = _finalize_output_resolution(
                 image=image,
-                minimum_long_edge=self.config.minimum_output_long_edge,
-                minimum_short_edge=self.config.minimum_output_short_edge,
-                minimum_pixels=self.config.minimum_output_pixels,
+                maximum_long_edge=self.config.maximum_output_long_edge,
+                maximum_short_edge=self.config.maximum_output_short_edge,
+                maximum_pixels=self.config.maximum_output_pixels,
                 upscale_mode=upscale_mode,
                 exact_output_size=exact_output_size,
             )
@@ -1480,6 +1604,15 @@ class QwenRunpodService:
             }
 
         images = _collect_input_images(job_input)
+        input_resize_meta: Dict[str, Any] | None = None
+        if images:
+            resized_input, input_resize_meta = _resize_image_to_limits(
+                image=images[0],
+                maximum_long_edge=self.config.maximum_input_long_edge,
+                maximum_short_edge=self.config.maximum_input_short_edge,
+                maximum_pixels=self.config.maximum_input_pixels,
+            )
+            images = [resized_input, *images[1:]]
         model_images = list(images)
         self.ensure_loaded()
 
@@ -1491,8 +1624,8 @@ class QwenRunpodService:
         num_images_per_prompt = _to_int(job_input.get("num_images_per_prompt"), 1)
         rewrite_prompt = _to_bool(job_input.get("rewrite_prompt"), self.config.default_rewrite_prompt)
         enforce_identity_lock = _to_bool(job_input.get("lock_face_identity"), self.config.lock_face_identity)
-        face_mask_mode = _normalize_mask_mode(job_input.get("face_mask_mode", self.config.face_mask_mode))
-        face_mask_strategy = _normalize_mask_strategy(job_input.get("face_mask_strategy", self.config.face_mask_strategy))
+        face_mask_mode = "strict" if enforce_identity_lock else "off"
+        face_mask_strategy = DEFAULT_FACE_MASK_STRATEGY if enforce_identity_lock else "off"
         face_mask_strength = _clamp_float(
             _to_float(job_input.get("face_mask_strength"), self.config.face_mask_strength),
             0.0,
@@ -1534,6 +1667,8 @@ class QwenRunpodService:
                     minimum_short_edge=native_min_short,
                     minimum_pixels=native_min_pixels,
                     maximum_long_edge=native_max_long,
+                    maximum_short_edge=self.config.maximum_native_short_edge,
+                    maximum_pixels=self.config.maximum_native_pixels,
                     size_multiple=self.config.generation_size_multiple,
                 )
         else:
@@ -1545,6 +1680,8 @@ class QwenRunpodService:
                 minimum_short_edge=native_min_short,
                 minimum_pixels=native_min_pixels,
                 maximum_long_edge=native_max_long,
+                maximum_short_edge=self.config.maximum_native_short_edge,
+                maximum_pixels=self.config.maximum_native_pixels,
                 size_multiple=self.config.generation_size_multiple,
             )
         explicit_guidance = _has_explicit_value(job_input, "true_guidance_scale")
@@ -1598,7 +1735,8 @@ class QwenRunpodService:
             f"preserve_source_exact_size={preserve_source_exact_size}, "
             f"source_output_size={source_output_size}, "
             f"preserve_composition={preserve_composition}, "
-            f"canvas_padding={canvas_padding}"
+            f"canvas_padding={canvas_padding}, "
+            f"input_resize_meta={input_resize_meta}"
         )
 
         started_at = time.time()
@@ -1709,6 +1847,7 @@ class QwenRunpodService:
                 "preserve_source_exact_size": preserve_source_exact_size,
                 "source_output_width": source_output_size[0] if source_output_size else None,
                 "source_output_height": source_output_size[1] if source_output_size else None,
+                "input_resize": input_resize_meta,
                 "preserve_composition": preserve_composition,
                 "canvas_padding": (
                     {

@@ -17,6 +17,12 @@ DEFAULT_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 DEFAULT_API_BASE = os.environ.get("RUNPOD_API_BASE", "https://api.runpod.ai/v2")
 DEFAULT_POLL_INTERVAL = float(os.environ.get("RUNPOD_POLL_INTERVAL", "5"))
 DEFAULT_TIMEOUT = int(os.environ.get("RUNPOD_JOB_TIMEOUT", "900"))
+MAX_REQUEST_BODY_BYTES = int(os.environ.get("RUNPOD_MAX_REQUEST_BODY_BYTES", "9500000"))
+DEFAULT_INPUT_MAX_LONG_EDGE = int(os.environ.get("RUNPOD_INPUT_MAX_LONG_EDGE", "1920"))
+DEFAULT_INPUT_MAX_SHORT_EDGE = int(os.environ.get("RUNPOD_INPUT_MAX_SHORT_EDGE", "1080"))
+DEFAULT_INPUT_MAX_PIXELS = int(os.environ.get("RUNPOD_INPUT_MAX_PIXELS", str(1920 * 1080)))
+INPUT_LONG_EDGE_CANDIDATES = [None, 1792, 1536, 1408, 1280, 1152, 1024]
+INPUT_JPEG_QUALITIES = [95, 90, 85, 80, 75, 70, 65]
 
 
 def image_to_data_uri(image: Image.Image, image_format: str = "PNG") -> str:
@@ -37,8 +43,79 @@ def remote_url_to_image(image_url: str) -> Image.Image:
     return Image.open(BytesIO(response.content)).convert("RGB")
 
 
-def build_payload(
-    image: Image.Image,
+def _flatten_for_upload(image: Image.Image) -> Image.Image:
+    if image.mode in {"RGBA", "LA"}:
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        alpha = image.getchannel("A") if "A" in image.getbands() else image.getchannel(image.getbands()[-1])
+        background.paste(image.convert("RGB"), mask=alpha)
+        return background
+    return image.convert("RGB")
+
+
+def _resize_to_long_edge(image: Image.Image, max_long_edge: int | None) -> Image.Image:
+    if max_long_edge is None:
+        return image
+
+    width, height = image.size
+    long_edge = max(width, height)
+    if long_edge <= max_long_edge:
+        return image
+
+    scale = max_long_edge / float(long_edge)
+    resized = image.resize(
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        resample=Image.Resampling.LANCZOS,
+    )
+    return resized
+
+
+def _fit_image_to_limits(image: Image.Image, max_long_edge: int, max_short_edge: int, max_pixels: int) -> Image.Image:
+    width, height = image.size
+    scale = 1.0
+    long_edge = max(width, height)
+    short_edge = min(width, height)
+    area = width * height
+
+    if max_long_edge > 0 and long_edge > max_long_edge:
+        scale = min(scale, max_long_edge / float(long_edge))
+    if max_short_edge > 0 and short_edge > max_short_edge:
+        scale = min(scale, max_short_edge / float(short_edge))
+    if max_pixels > 0 and area > max_pixels:
+        scale = min(scale, (max_pixels / float(area)) ** 0.5)
+
+    if scale >= 0.9999:
+        return image
+
+    return image.resize(
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        resample=Image.Resampling.LANCZOS,
+    )
+
+
+def _encode_upload_candidate(image: Image.Image, image_format: str, quality: int | None = None) -> tuple[str, int]:
+    buffer = BytesIO()
+    save_kwargs: Dict[str, Any] = {}
+    if image_format.upper() == "JPEG":
+        save_kwargs.update(
+            {
+                "format": "JPEG",
+                "quality": int(quality if quality is not None else 90),
+                "optimize": True,
+                "progressive": True,
+                "subsampling": 0,
+            }
+        )
+    else:
+        save_kwargs.update({"format": "PNG", "optimize": True, "compress_level": 9})
+
+    image.save(buffer, **save_kwargs)
+    encoded_bytes = buffer.getvalue()
+    encoded = base64.b64encode(encoded_bytes).decode("utf-8")
+    return f"data:image/{image_format.lower()};base64,{encoded}", len(encoded_bytes)
+
+
+def _build_request_payload(
+    image_data_uri: str,
     prompt: str,
     seed: int,
     auto_steps: bool,
@@ -48,8 +125,6 @@ def build_payload(
     quality_mode: str,
     rewrite_prompt: bool,
     lock_face_identity: bool,
-    face_mask_strategy: str,
-    face_mask_mode: str,
     face_mask_strength: float,
     debug_masks: bool,
     postprocess_upscale_mode: str,
@@ -61,14 +136,12 @@ def build_payload(
     payload: Dict[str, Any] = {
         "input": {
             "prompt": prompt,
-            "images": [{"base64": image_to_data_uri(image.convert("RGB"), image_format="PNG")}],
+            "images": [{"base64": image_data_uri}],
             "seed": seed,
             "randomize_seed": False,
             "quality_mode": quality_mode,
             "rewrite_prompt": rewrite_prompt,
             "lock_face_identity": lock_face_identity,
-            "face_mask_strategy": face_mask_strategy,
-            "face_mask_mode": face_mask_mode,
             "face_mask_strength": face_mask_strength,
             "debug_masks": debug_masks,
             "postprocess_upscale_mode": postprocess_upscale_mode,
@@ -87,6 +160,82 @@ def build_payload(
         payload["input"]["height"] = int(float(height))
 
     return payload
+
+
+def build_payload(
+    image: Image.Image,
+    prompt: str,
+    seed: int,
+    auto_steps: bool,
+    num_inference_steps: int,
+    auto_guidance: bool,
+    true_guidance_scale: float,
+    quality_mode: str,
+    rewrite_prompt: bool,
+    lock_face_identity: bool,
+    face_mask_strength: float,
+    debug_masks: bool,
+    postprocess_upscale_mode: str,
+    width: str,
+    height: str,
+    num_images_per_prompt: int,
+    output_format: str,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    base_image = _fit_image_to_limits(
+        _flatten_for_upload(image),
+        max_long_edge=DEFAULT_INPUT_MAX_LONG_EDGE,
+        max_short_edge=DEFAULT_INPUT_MAX_SHORT_EDGE,
+        max_pixels=DEFAULT_INPUT_MAX_PIXELS,
+    )
+    best_failure: Dict[str, Any] | None = None
+
+    for max_long_edge in INPUT_LONG_EDGE_CANDIDATES:
+        resized = _resize_to_long_edge(base_image, max_long_edge)
+
+        for image_format, quality in [("PNG", None)] + [("JPEG", q) for q in INPUT_JPEG_QUALITIES]:
+            try:
+                image_data_uri, encoded_size = _encode_upload_candidate(resized, image_format=image_format, quality=quality)
+            except OSError:
+                continue
+
+            payload = _build_request_payload(
+                image_data_uri=image_data_uri,
+                prompt=prompt,
+                seed=seed,
+                auto_steps=auto_steps,
+                num_inference_steps=num_inference_steps,
+                auto_guidance=auto_guidance,
+                true_guidance_scale=true_guidance_scale,
+                quality_mode=quality_mode,
+                rewrite_prompt=rewrite_prompt,
+                lock_face_identity=lock_face_identity,
+                face_mask_strength=face_mask_strength,
+                debug_masks=debug_masks,
+                postprocess_upscale_mode=postprocess_upscale_mode,
+                width=width,
+                height=height,
+                num_images_per_prompt=num_images_per_prompt,
+                output_format=output_format,
+            )
+            body_size = len(json.dumps(payload).encode("utf-8"))
+            metadata = {
+                "upload_format": image_format.lower(),
+                "upload_quality": quality,
+                "upload_width": resized.width,
+                "upload_height": resized.height,
+                "upload_bytes": encoded_size,
+                "request_body_bytes": body_size,
+            }
+            if body_size <= MAX_REQUEST_BODY_BYTES:
+                return payload, metadata
+            best_failure = metadata
+
+    failure = best_failure or {}
+    raise ValueError(
+        "Input image is still too large for Runpod after automatic compression. "
+        f"Last attempt: {failure.get('upload_width', 'n/a')}x{failure.get('upload_height', 'n/a')} "
+        f"{failure.get('upload_format', 'n/a')} request body {failure.get('request_body_bytes', 'n/a')} bytes."
+    )
 
 def submit_job(
     endpoint_id: str,
@@ -180,8 +329,6 @@ def run_inference(
     quality_mode: str,
     rewrite_prompt: bool,
     lock_face_identity: bool,
-    face_mask_strategy: str,
-    face_mask_mode: str,
     face_mask_strength: float,
     debug_masks: bool,
     postprocess_upscale_mode: str,
@@ -199,7 +346,7 @@ def run_inference(
     if not prompt.strip():
         raise gr.Error("Prompt is required.")
 
-    payload = build_payload(
+    payload, input_upload_meta = build_payload(
         image=image,
         prompt=prompt,
         seed=int(seed),
@@ -210,8 +357,6 @@ def run_inference(
         quality_mode=quality_mode,
         rewrite_prompt=bool(rewrite_prompt),
         lock_face_identity=bool(lock_face_identity),
-        face_mask_strategy=face_mask_strategy,
-        face_mask_mode=face_mask_mode,
         face_mask_strength=float(face_mask_strength),
         debug_masks=bool(debug_masks),
         postprocess_upscale_mode=postprocess_upscale_mode,
@@ -234,7 +379,6 @@ def run_inference(
         face_masking = output.get("face_masking") or []
         first_mask = face_masking[0] if face_masking else {}
         first_drift = first_mask.get("identity_drift") or {}
-        identity_retry = generation.get("identity_retry") or {}
         delivered_resolution_text = (
             f"{first_image.get('width', 'n/a')}x{first_image.get('height', 'n/a')}"
             if first_image
@@ -251,16 +395,23 @@ def run_inference(
             else "n/a"
         )
         attempt_count = len(generation.get("attempts") or [])
+        upload_quality_text = (
+            f" q{input_upload_meta.get('upload_quality')}" if input_upload_meta.get("upload_quality") else ""
+        )
         status_text = (
             f"Job {job_id}\n"
             f"Status: {result.get('status')}\n"
+            f"Upload prep: {input_upload_meta.get('upload_width', 'n/a')}x{input_upload_meta.get('upload_height', 'n/a')} "
+            f"{input_upload_meta.get('upload_format', 'n/a')}"
+            f"{upload_quality_text} "
+            f"({input_upload_meta.get('request_body_bytes', 'n/a')} bytes)\n"
             f"Mask: {first_mask.get('engine', 'n/a')} / {output.get('face_mask_strategy', 'n/a')} / {output.get('face_mask_mode', 'n/a')}\n"
             f"Quality: {generation.get('quality_mode', 'n/a')} ({generation.get('prompt_intent', 'n/a')})\n"
             f"Source target: {source_target_resolution_text}\n"
             f"Generated: {generated_resolution_text}\n"
             f"Delivered: {delivered_resolution_text}\n"
             f"Identity drift: {first_drift.get('score', 'n/a')}\n"
-            f"Identity retry: {'used' if identity_retry.get('used') else 'attempted' if identity_retry.get('attempted') else 'not needed'}\n"
+            f"Liquid recovery: {'used' if first_mask.get('liquid_recovery_applied') else first_mask.get('liquid_recovery_reason', 'not requested')}\n"
             f"Face coverage: {generation.get('face_coverage', 'n/a')}\n"
             f"Attempts: {attempt_count}\n"
             f"Delay: {result.get('delayTime', 'n/a')} ms\n"
@@ -278,8 +429,8 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
     gr.Markdown("# Runpod Qwen Image Test Client")
     gr.Markdown(
         "Upload one image, enter a prompt, and test your Runpod endpoint. "
-        "The worker now supports smart parsing-based masking, exposed-skin preservation, adaptive quality planning, "
-        "debug masks, and a legacy fallback path."
+        "The worker now uses a strict identity-lock path, optional liquid-detail recovery for wet or droplet prompts, "
+        "adaptive quality planning, and debug masks."
     )
 
     with gr.Row():
@@ -308,8 +459,6 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
         with gr.Row():
             rewrite_prompt = gr.Checkbox(label="Rewrite Prompt", value=False)
             lock_face_identity = gr.Checkbox(label="Lock Face Identity", value=True)
-            face_mask_strategy = gr.Dropdown(label="Mask Strategy", choices=["smart", "preserve_skin", "auto", "legacy"], value="smart")
-            face_mask_mode = gr.Dropdown(label="Face Mask Mode", choices=["surface_fx", "balanced", "strict", "off"], value="surface_fx")
             face_mask_strength = gr.Slider(label="Mask Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.86)
             debug_masks = gr.Checkbox(label="Debug Masks", value=False)
             num_images_per_prompt = gr.Slider(label="Images Per Prompt", minimum=1, maximum=4, step=1, value=1)
@@ -344,8 +493,6 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
             quality_mode,
             rewrite_prompt,
             lock_face_identity,
-            face_mask_strategy,
-            face_mask_mode,
             face_mask_strength,
             debug_masks,
             postprocess_upscale_mode,
