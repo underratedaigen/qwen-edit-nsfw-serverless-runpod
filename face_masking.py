@@ -345,6 +345,65 @@ HEAD_ORIENTATION_CHANGE_HINTS = (
     "gaze direction",
 )
 
+LIGHTING_CHANGE_HINTS = (
+    "change lighting",
+    "different lighting",
+    "studio lighting",
+    "sunset light",
+    "golden hour",
+    "dramatic lighting",
+    "dark lighting",
+    "bright lighting",
+    "neon lighting",
+    "cinematic lighting",
+)
+
+VIEWPOINT_CHANGE_HINTS = (
+    "camera angle",
+    "different angle",
+    "new angle",
+    "viewpoint",
+    "different viewpoint",
+    "perspective",
+    "different perspective",
+    "side view",
+    "profile",
+    "three-quarter",
+    "3/4 view",
+    "overhead",
+    "low angle",
+    "high angle",
+)
+
+EDIT_REGIME_SAME_VIEW_MINOR = "same_view_minor_edit"
+EDIT_REGIME_SAME_VIEW_SURFACE = "same_view_surface_edit"
+EDIT_REGIME_POSE_OR_VIEW = "pose_or_view_change"
+
+STRATEGY_AUTO = "auto"
+STRATEGY_STRICT_IDENTITY = "strict_identity"
+STRATEGY_PRESERVE_SKIN = "preserve_skin"
+STRATEGY_SMART = "smart"
+STRATEGY_LEGACY = "legacy"
+STRATEGY_OFF = "off"
+SUPPORTED_STRATEGIES = {
+    STRATEGY_AUTO,
+    STRATEGY_STRICT_IDENTITY,
+    STRATEGY_PRESERVE_SKIN,
+    STRATEGY_SMART,
+    STRATEGY_LEGACY,
+    STRATEGY_OFF,
+    "none",
+}
+SUPPORTED_MODES = {"strict", "balanced", "surface_fx", "off"}
+
+DRIFT_SURFACE_RELAX_SCORE = 0.22
+DRIFT_POSE_OR_VIEW_SCORE = 0.34
+DRIFT_SKIP_RESCUE_SCORE = 0.58
+DRIFT_ORIENTATION_POSE_THRESHOLD = 0.55
+DRIFT_SCALE_POSE_THRESHOLD = 0.18
+DRIFT_ASPECT_POSE_THRESHOLD = 0.16
+PARSER_MIN_CONFIDENCE = 0.25
+
 
 def _connection_ids(connections: Iterable[tuple[int, int]]) -> list[int]:
     ids: set[int] = set()
@@ -654,28 +713,83 @@ def _normalize_prompt(prompt: str | None) -> str:
     return " ".join(str(prompt or "").lower().split())
 
 
-def _position_change_hints(prompt: str | None) -> list[str]:
+def _scan_terms(normalized_prompt: str, terms: Sequence[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        if term in normalized_prompt and term not in seen:
+            seen.add(term)
+            ordered.append(term)
+    return ordered
+
+
+@dataclass(frozen=True)
+class FaceEditIntent:
+    changes_expression: bool = False
+    changes_face_structure: bool = False
+    changes_head_orientation: bool = False
+    changes_body_pose: bool = False
+    changes_surface_effects: bool = False
+    changes_lighting: bool = False
+    changes_viewpoint: bool = False
+    likely_same_view: bool = True
+    matched_terms: Dict[str, list[str]] = field(default_factory=dict)
+
+    @property
+    def edit_regime(self) -> str:
+        if self.changes_body_pose or self.changes_head_orientation or self.changes_viewpoint:
+            return EDIT_REGIME_POSE_OR_VIEW
+        if (
+            self.changes_surface_effects
+            or self.changes_expression
+            or self.changes_face_structure
+            or self.changes_lighting
+        ):
+            return EDIT_REGIME_SAME_VIEW_SURFACE
+        return EDIT_REGIME_SAME_VIEW_MINOR
+
+
+def classify_face_edit_intent(prompt: str | None) -> FaceEditIntent:
+    """Heuristic prompt parser; centralized so new intent hints do not scatter across the pipeline."""
     normalized = _normalize_prompt(prompt)
     if not normalized:
-        return []
+        return FaceEditIntent(matched_terms={})
 
-    matches: list[str] = []
-    for term in POSITION_CHANGE_HINTS:
-        if term in normalized:
-            matches.append(term)
-
+    body_pose_terms = _scan_terms(normalized, POSITION_CHANGE_HINTS)
     if any(term in normalized for term in POSITION_CHANGE_VERBS) and any(
         term in normalized for term in POSITION_CHANGE_TARGETS
     ):
-        matches.append("body-motion")
+        body_pose_terms.append("body-motion")
 
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for match in matches:
-        if match not in seen:
-            seen.add(match)
-            ordered.append(match)
-    return ordered
+    matched_terms = {
+        "expression": _scan_terms(normalized, FACE_EXPRESSION_CHANGE_HINTS),
+        "face_structure": _scan_terms(normalized, FACE_STRUCTURE_CHANGE_HINTS),
+        "head_orientation": _scan_terms(normalized, HEAD_ORIENTATION_CHANGE_HINTS),
+        "body_pose": list(dict.fromkeys(body_pose_terms)),
+        "surface_effects": _scan_terms(normalized, SURFACE_EFFECT_HINTS),
+        "lighting": _scan_terms(normalized, LIGHTING_CHANGE_HINTS),
+        "viewpoint": _scan_terms(normalized, VIEWPOINT_CHANGE_HINTS),
+    }
+    changes_head_orientation = bool(matched_terms["head_orientation"])
+    changes_body_pose = bool(matched_terms["body_pose"])
+    changes_viewpoint = bool(matched_terms["viewpoint"])
+    likely_same_view = not (changes_head_orientation or changes_body_pose or changes_viewpoint)
+
+    return FaceEditIntent(
+        changes_expression=bool(matched_terms["expression"]),
+        changes_face_structure=bool(matched_terms["face_structure"]),
+        changes_head_orientation=changes_head_orientation,
+        changes_body_pose=changes_body_pose,
+        changes_surface_effects=bool(matched_terms["surface_effects"]),
+        changes_lighting=bool(matched_terms["lighting"]),
+        changes_viewpoint=changes_viewpoint,
+        likely_same_view=likely_same_view,
+        matched_terms=matched_terms,
+    )
+
+
+def _position_change_hints(prompt: str | None) -> list[str]:
+    return classify_face_edit_intent(prompt).matched_terms.get("body_pose", [])
 
 
 def _is_liquid_request(prompt: str | None) -> bool:
@@ -693,17 +807,7 @@ def _uses_broad_surface_sheen(prompt: str | None) -> bool:
 
 
 def _surface_effect_terms(prompt: str | None) -> list[str]:
-    normalized = _normalize_prompt(prompt)
-    if not normalized:
-        return []
-
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for term in SURFACE_EFFECT_HINTS:
-        if term in normalized and term not in seen:
-            seen.add(term)
-            ordered.append(term)
-    return ordered
+    return classify_face_edit_intent(prompt).matched_terms.get("surface_effects", [])
 
 
 def _requests_surface_effect(prompt: str | None) -> bool:
@@ -725,36 +829,15 @@ def _uses_color_surface_effects(prompt: str | None) -> bool:
 
 
 def _requests_face_expression_change(prompt: str | None) -> bool:
-    normalized = _normalize_prompt(prompt)
-    if not normalized:
-        return False
-    return any(term in normalized for term in FACE_EXPRESSION_CHANGE_HINTS)
+    return classify_face_edit_intent(prompt).changes_expression
 
 
 def _requests_face_structure_change(prompt: str | None) -> bool:
-    normalized = _normalize_prompt(prompt)
-    if not normalized:
-        return False
-    return any(term in normalized for term in FACE_STRUCTURE_CHANGE_HINTS)
+    return classify_face_edit_intent(prompt).changes_face_structure
 
 
 def _head_orientation_hints(prompt: str | None) -> list[str]:
-    normalized = _normalize_prompt(prompt)
-    if not normalized:
-        return []
-
-    matches: list[str] = []
-    for term in HEAD_ORIENTATION_CHANGE_HINTS:
-        if term in normalized:
-            matches.append(term)
-
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for match in matches:
-        if match not in seen:
-            seen.add(match)
-            ordered.append(match)
-    return ordered
+    return classify_face_edit_intent(prompt).matched_terms.get("head_orientation", [])
 
 
 def _should_preserve_source_head_orientation(prompt: str | None) -> bool:
@@ -862,6 +945,37 @@ class ParserFaceData:
     score: float | None = None
 
 
+@dataclass(frozen=True)
+class FaceCandidate:
+    index: int
+    landmarks: list[tuple[float, float]]
+    bbox: tuple[float, float, float, float]
+    area: float
+    center: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class FaceMatchInfo:
+    source_index: int | None = None
+    generated_index: int | None = None
+    source_count: int = 0
+    generated_count: int = 0
+    method: str = "largest"
+
+
+@dataclass(frozen=True)
+class RescueDecision:
+    strategy_requested: str
+    strategy_used: str
+    mode_requested: str
+    mode_used: str
+    edit_regime: str
+    strength_scale: float
+    skip_rescue: bool = False
+    retry_recommended: bool = False
+    reason: str = "default"
+
+
 class _FacerParserRuntime:
     def __init__(self, parser_model: str = "farl/lapa/448", device: str | None = None) -> None:
         if torch is None or facer is None:
@@ -905,7 +1019,7 @@ class FaceIdentityMasker:
         face_mesh = mp.solutions.face_mesh
         self._mesh = face_mesh.FaceMesh(
             static_image_mode=True,
-            max_num_faces=1,
+            max_num_faces=4,
             refine_landmarks=True,
             min_detection_confidence=0.5,
         )
@@ -920,6 +1034,7 @@ class FaceIdentityMasker:
         self._parser_model = parser_model
         self._parser_runtime: _FacerParserRuntime | None = None
         self._parser_failed = False
+        self._last_face_match_info = FaceMatchInfo()
 
     def _align_source_to_generated(
         self,
@@ -928,8 +1043,19 @@ class FaceIdentityMasker:
     ) -> tuple[Image.Image, list[tuple[float, float]] | None, list[tuple[float, float]] | None, str]:
         source_rgb = source_image.convert("RGB")
         generated_rgb = generated_image.convert("RGB")
-        source_landmarks = self._extract_landmarks(source_rgb)
-        generated_landmarks = self._extract_landmarks(generated_rgb)
+        source_candidates = self._extract_face_candidates(source_rgb)
+        source_candidate = self._select_face_candidate(source_candidates)
+        generated_candidates = self._extract_face_candidates(generated_rgb)
+        generated_candidate = self._select_face_candidate(generated_candidates, reference=source_candidate)
+        source_landmarks = source_candidate.landmarks if source_candidate is not None else None
+        generated_landmarks = generated_candidate.landmarks if generated_candidate is not None else None
+        self._last_face_match_info = FaceMatchInfo(
+            source_index=source_candidate.index if source_candidate is not None else None,
+            generated_index=generated_candidate.index if generated_candidate is not None else None,
+            source_count=len(source_candidates),
+            generated_count=len(generated_candidates),
+            method="largest-or-geometry",
+        )
 
         if source_landmarks and generated_landmarks:
             source_anchors = self._anchors(source_landmarks)
@@ -1003,17 +1129,58 @@ class FaceIdentityMasker:
 
         return source_rgb, source_landmarks, generated_landmarks, "direct"
 
-    def _extract_landmarks(self, image: Image.Image) -> list[tuple[float, float]] | None:
+    def _extract_face_candidates(self, image: Image.Image) -> list[FaceCandidate]:
         rgb = np.asarray(image.convert("RGB"))
         result = self._mesh.process(rgb)
         if not result.multi_face_landmarks:
-            return None
+            return []
 
         width, height = image.size
-        points: list[tuple[float, float]] = []
-        for landmark in result.multi_face_landmarks[0].landmark:
-            points.append((landmark.x * width, landmark.y * height))
-        return points
+        candidates: list[FaceCandidate] = []
+        for index, face_landmarks in enumerate(result.multi_face_landmarks):
+            points = [(landmark.x * width, landmark.y * height) for landmark in face_landmarks.landmark]
+            bbox = self._face_bbox(points)
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = bbox
+            area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            candidates.append(
+                FaceCandidate(
+                    index=index,
+                    landmarks=points,
+                    bbox=bbox,
+                    area=area,
+                    center=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                )
+            )
+        return sorted(candidates, key=lambda item: item.area, reverse=True)
+
+    def _select_face_candidate(
+        self,
+        candidates: Sequence[FaceCandidate],
+        reference: FaceCandidate | None = None,
+    ) -> FaceCandidate | None:
+        if not candidates:
+            return None
+        if reference is None:
+            return max(candidates, key=lambda item: item.area)
+
+        # Current matching is geometry-only scaffolding; embeddings can plug in here later.
+        ref_area = max(reference.area, 1.0)
+        best_score = float("inf")
+        best_candidate = candidates[0]
+        for candidate in candidates:
+            area_score = abs(math.log(max(candidate.area, 1.0) / ref_area))
+            center_score = math.dist(candidate.center, reference.center) / max(math.sqrt(ref_area), 1.0)
+            score = (0.7 * area_score) + (0.3 * center_score)
+            if score < best_score:
+                best_score = score
+                best_candidate = candidate
+        return best_candidate
+
+    def _extract_landmarks(self, image: Image.Image) -> list[tuple[float, float]] | None:
+        candidate = self._select_face_candidate(self._extract_face_candidates(image))
+        return candidate.landmarks if candidate is not None else None
 
     def estimate_face_coverage(self, image: Image.Image) -> float | None:
         landmarks = self._extract_landmarks(image)
@@ -2996,12 +3163,24 @@ class FaceIdentityMasker:
         strength: float,
         prompt: str | None,
         debug: bool,
+        mode: str = "strict",
+        edit_regime: str = EDIT_REGIME_SAME_VIEW_MINOR,
+        drift_assessment: Dict[str, Any] | None = None,
     ) -> FaceMaskResult:
+        normalized_mode = (mode or "strict").strip().lower()
+        if normalized_mode not in SUPPORTED_MODES:
+            normalized_mode = "strict"
+        base_mode = normalized_mode
+        if edit_regime == EDIT_REGIME_POSE_OR_VIEW:
+            base_mode = "balanced"
+        elif edit_regime == EDIT_REGIME_SAME_VIEW_SURFACE and normalized_mode == "strict":
+            base_mode = "surface_fx"
+
         try:
             base_result = self._smart_protect(
                 source_image=source_image,
                 generated_image=generated_image,
-                mode="strict",
+                mode=base_mode,
                 strength=strength,
                 debug=debug,
             )
@@ -3018,25 +3197,38 @@ class FaceIdentityMasker:
             base_result.metadata["fallback"] = "legacy"
             base_result.metadata["base_engine"] = base_result.engine
 
-        try:
-            result = self._reinforce_strict_identity(
-                source_image=source_image,
-                generated_image=generated_image,
-                protected_result=base_result,
-                strength=strength,
-                prompt=prompt,
-                debug=debug,
-            )
-        except Exception as exc:
+        should_reinforce = (
+            edit_regime == EDIT_REGIME_SAME_VIEW_MINOR
+            and normalized_mode == "strict"
+            and base_result.applied
+            and (not drift_assessment or drift_assessment.get("available", True))
+        )
+        if should_reinforce:
+            try:
+                result = self._reinforce_strict_identity(
+                    source_image=source_image,
+                    generated_image=generated_image,
+                    protected_result=base_result,
+                    strength=strength,
+                    prompt=prompt,
+                    debug=debug,
+                )
+            except Exception as exc:
+                result = base_result
+                result.metadata["strict_reinforcement_applied"] = False
+                result.metadata["strict_reinforcement_reason"] = f"fallback:{exc}"
+                result.reason = f"{result.reason}; strict-reinforcement-fallback:{exc}"
+        else:
             result = base_result
             result.metadata["strict_reinforcement_applied"] = False
-            result.metadata["strict_reinforcement_reason"] = f"fallback:{exc}"
-            result.reason = f"{result.reason}; strict-reinforcement-fallback:{exc}"
+            result.metadata["strict_reinforcement_reason"] = f"skipped-for-{edit_regime}-{base_mode}"
 
-        result.mode = "strict"
+        result.mode = normalized_mode
         result.engine = "strict_identity"
         result.metadata["strategy_used"] = "strict_identity"
         result.metadata["strict_identity_lock"] = True
+        result.metadata["strict_identity_base_mode"] = base_mode
+        result.metadata["strict_identity_edit_regime"] = edit_regime
         return result
 
     def _apply_liquid_surface_recovery(
@@ -3529,6 +3721,189 @@ class FaceIdentityMasker:
             debug_images=debug_images,
         )
 
+    def _normalize_strategy(self, strategy: str | None) -> str:
+        normalized = str(strategy or STRATEGY_AUTO).strip().lower()
+        if normalized == "none":
+            return STRATEGY_OFF
+        if normalized not in SUPPORTED_STRATEGIES:
+            return STRATEGY_AUTO
+        return normalized
+
+    def _normalize_mode(self, mode: str | None) -> str:
+        normalized = str(mode or "strict").strip().lower()
+        if normalized not in SUPPORTED_MODES:
+            return "strict"
+        return normalized
+
+    def _safe_assess_identity_drift(
+        self,
+        source_image: Image.Image,
+        generated_image: Image.Image,
+        prompt: str | None,
+    ) -> Dict[str, Any]:
+        try:
+            return self.assess_identity_drift(source_image, generated_image, prompt=prompt)
+        except Exception as exc:
+            return {"available": False, "reason": f"assessment-failed:{exc}"}
+
+    def _regime_from_intent_and_drift(
+        self,
+        intent: FaceEditIntent,
+        drift_assessment: Dict[str, Any],
+    ) -> str:
+        regime = intent.edit_regime
+        if not drift_assessment.get("available"):
+            return regime
+
+        score = float(drift_assessment.get("score") or 0.0)
+        orientation_error = float(drift_assessment.get("orientation_error") or 0.0)
+        scale_error = float(drift_assessment.get("face_scale_error") or 0.0)
+        aspect_error = float(drift_assessment.get("face_aspect_ratio_error") or 0.0)
+        if (
+            regime != EDIT_REGIME_POSE_OR_VIEW
+            and (
+                score >= DRIFT_POSE_OR_VIEW_SCORE
+                or orientation_error >= DRIFT_ORIENTATION_POSE_THRESHOLD
+                or scale_error >= DRIFT_SCALE_POSE_THRESHOLD
+                or aspect_error >= DRIFT_ASPECT_POSE_THRESHOLD
+            )
+        ):
+            return EDIT_REGIME_POSE_OR_VIEW
+        if regime == EDIT_REGIME_SAME_VIEW_MINOR and score >= DRIFT_SURFACE_RELAX_SCORE:
+            return EDIT_REGIME_SAME_VIEW_SURFACE
+        return regime
+
+    def _build_rescue_decision(
+        self,
+        strategy: str,
+        mode: str,
+        intent: FaceEditIntent,
+        drift_assessment: Dict[str, Any],
+    ) -> RescueDecision:
+        regime = self._regime_from_intent_and_drift(intent, drift_assessment)
+        requested_strategy = self._normalize_strategy(strategy)
+        requested_mode = self._normalize_mode(mode)
+        retry_recommended = bool(
+            drift_assessment.get("available")
+            and float(drift_assessment.get("score") or 0.0) >= DRIFT_POSE_OR_VIEW_SCORE
+        )
+
+        if requested_strategy == STRATEGY_OFF or requested_mode == "off":
+            return RescueDecision(
+                strategy_requested=requested_strategy,
+                strategy_used=STRATEGY_OFF,
+                mode_requested=requested_mode,
+                mode_used="off",
+                edit_regime=regime,
+                strength_scale=0.0,
+                skip_rescue=True,
+                retry_recommended=retry_recommended,
+                reason="disabled",
+            )
+
+        strategy_used = requested_strategy
+        if requested_strategy == STRATEGY_AUTO:
+            if regime == EDIT_REGIME_POSE_OR_VIEW:
+                strategy_used = STRATEGY_SMART
+            elif regime == EDIT_REGIME_SAME_VIEW_SURFACE:
+                strategy_used = STRATEGY_SMART
+            else:
+                strategy_used = STRATEGY_STRICT_IDENTITY
+
+        mode_used = requested_mode
+        strength_scale = 1.0
+        reason = "requested"
+
+        if regime == EDIT_REGIME_POSE_OR_VIEW:
+            strength_scale = 0.38
+            reason = "relaxed-for-pose-or-view"
+            if mode_used == "strict":
+                mode_used = "balanced"
+        elif regime == EDIT_REGIME_SAME_VIEW_SURFACE:
+            strength_scale = 0.68
+            reason = "surface-edit-relaxed"
+            if mode_used == "strict":
+                mode_used = "surface_fx"
+        elif mode_used == "surface_fx":
+            strength_scale = 0.72
+            reason = "surface-mode-requested"
+
+        if (
+            drift_assessment.get("available")
+            and float(drift_assessment.get("score") or 0.0) >= DRIFT_SKIP_RESCUE_SCORE
+            and regime == EDIT_REGIME_POSE_OR_VIEW
+            and requested_strategy in {STRATEGY_AUTO, STRATEGY_STRICT_IDENTITY}
+        ):
+            return RescueDecision(
+                strategy_requested=requested_strategy,
+                strategy_used=strategy_used,
+                mode_requested=requested_mode,
+                mode_used=mode_used,
+                edit_regime=regime,
+                strength_scale=strength_scale,
+                skip_rescue=True,
+                retry_recommended=True,
+                reason="drift-too-high-for-safe-rescue",
+            )
+
+        return RescueDecision(
+            strategy_requested=requested_strategy,
+            strategy_used=strategy_used,
+            mode_requested=requested_mode,
+            mode_used=mode_used,
+            edit_regime=regime,
+            strength_scale=strength_scale,
+            retry_recommended=retry_recommended,
+            reason=reason,
+        )
+
+    def _face_match_metadata(self) -> Dict[str, Any]:
+        match = getattr(self, "_last_face_match_info", FaceMatchInfo())
+        return {
+            "source_face_index": match.source_index,
+            "generated_face_index": match.generated_index,
+            "source_face_count": match.source_count,
+            "generated_face_count": match.generated_count,
+            "face_match_method": match.method,
+        }
+
+    def _standardize_result_metadata(
+        self,
+        result: FaceMaskResult,
+        decision: RescueDecision,
+        intent: FaceEditIntent,
+        drift_assessment: Dict[str, Any],
+        fallback_reason: str | None = None,
+    ) -> FaceMaskResult:
+        result.metadata.setdefault("strategy_requested", decision.strategy_requested)
+        result.metadata["strategy_used"] = decision.strategy_used if decision.strategy_used != STRATEGY_OFF else result.metadata.get("strategy_used", STRATEGY_OFF)
+        result.metadata["mode_requested"] = decision.mode_requested
+        result.metadata["mode_used"] = decision.mode_used
+        result.metadata["edit_regime"] = decision.edit_regime
+        result.metadata["routing_reason"] = decision.reason
+        result.metadata["rescue_strength_scale"] = round(decision.strength_scale, 3)
+        result.metadata["retry_recommended"] = decision.retry_recommended
+        result.metadata["intent"] = {
+            "changes_expression": intent.changes_expression,
+            "changes_face_structure": intent.changes_face_structure,
+            "changes_head_orientation": intent.changes_head_orientation,
+            "changes_body_pose": intent.changes_body_pose,
+            "changes_surface_effects": intent.changes_surface_effects,
+            "changes_lighting": intent.changes_lighting,
+            "changes_viewpoint": intent.changes_viewpoint,
+            "likely_same_view": intent.likely_same_view,
+            "matched_terms": intent.matched_terms,
+        }
+        result.metadata["identity_drift_score"] = drift_assessment.get("score")
+        result.metadata["identity_drift_available"] = bool(drift_assessment.get("available"))
+        if not drift_assessment.get("available"):
+            result.metadata["identity_drift_reason"] = drift_assessment.get("reason")
+        result.metadata.update(self._face_match_metadata())
+        result.metadata["parser_available"] = not getattr(self, "_parser_failed", False)
+        if fallback_reason:
+            result.metadata["fallback_reason"] = fallback_reason
+        return result
+
     def protect(
         self,
         source_image: Image.Image,
@@ -3539,19 +3914,95 @@ class FaceIdentityMasker:
         prompt: str | None = None,
         debug: bool = False,
     ) -> FaceMaskResult:
-        normalized_mode = (mode or "strict").strip().lower()
-
-        if normalized_mode == "off":
-            return FaceMaskResult(image=generated_image, applied=False, mode="off", reason="disabled", engine="none")
-
-        result = self._strict_identity_protect(
-            source_image=source_image,
-            generated_image=generated_image,
-            strength=strength,
-            prompt=prompt,
-            debug=debug,
+        intent = classify_face_edit_intent(prompt)
+        drift_assessment = self._safe_assess_identity_drift(source_image, generated_image, prompt)
+        decision = self._build_rescue_decision(
+            strategy=strategy,
+            mode=mode,
+            intent=intent,
+            drift_assessment=drift_assessment,
         )
-        result.metadata.setdefault("strategy_requested", "strict_identity")
+
+        if decision.skip_rescue:
+            result = FaceMaskResult(
+                image=generated_image.convert("RGB"),
+                applied=False,
+                mode=decision.mode_used,
+                reason=f"rescue-skipped:{decision.reason}",
+                engine="none",
+                metadata={"strategy_used": decision.strategy_used, "rescue_skipped": True},
+            )
+            return self._standardize_result_metadata(result, decision, intent, drift_assessment)
+
+        effective_strength = float(np.clip(strength * decision.strength_scale, 0.0, 1.0))
+        fallback_reason: str | None = None
+        try:
+            if decision.strategy_used == STRATEGY_STRICT_IDENTITY:
+                result = self._strict_identity_protect(
+                    source_image=source_image,
+                    generated_image=generated_image,
+                    strength=effective_strength,
+                    prompt=prompt,
+                    debug=debug,
+                    mode=decision.mode_used,
+                    edit_regime=decision.edit_regime,
+                    drift_assessment=drift_assessment,
+                )
+            elif decision.strategy_used == STRATEGY_PRESERVE_SKIN:
+                result = self._preserve_skin_protect(
+                    source_image=source_image,
+                    generated_image=generated_image,
+                    mode=decision.mode_used,
+                    strength=effective_strength,
+                    prompt=prompt,
+                    debug=debug,
+                )
+            elif decision.strategy_used == STRATEGY_SMART:
+                try:
+                    result = self._smart_protect(
+                        source_image=source_image,
+                        generated_image=generated_image,
+                        mode=decision.mode_used,
+                        strength=effective_strength,
+                        debug=debug,
+                    )
+                except Exception as exc:
+                    fallback_reason = f"smart-fallback:{exc}"
+                    result = self._legacy_protect(
+                        source_image=source_image,
+                        generated_image=generated_image,
+                        mode=decision.mode_used,
+                        debug=debug,
+                    )
+                    result.reason = f"{result.reason}; {fallback_reason}"
+                    result.metadata["strategy_used"] = STRATEGY_SMART
+                    result.metadata["fallback"] = STRATEGY_LEGACY
+            elif decision.strategy_used == STRATEGY_LEGACY:
+                result = self._legacy_protect(
+                    source_image=source_image,
+                    generated_image=generated_image,
+                    mode=decision.mode_used,
+                    debug=debug,
+                )
+            else:
+                result = FaceMaskResult(
+                    image=generated_image.convert("RGB"),
+                    applied=False,
+                    mode="off",
+                    reason="disabled",
+                    engine="none",
+                    metadata={"strategy_used": STRATEGY_OFF},
+                )
+        except Exception as exc:
+            fallback_reason = f"strategy-failed:{exc}"
+            result = self._legacy_protect(
+                source_image=source_image,
+                generated_image=generated_image,
+                mode="balanced" if decision.edit_regime == EDIT_REGIME_POSE_OR_VIEW else decision.mode_used,
+                debug=debug,
+            )
+            result.reason = f"{result.reason}; {fallback_reason}"
+            result.metadata["fallback"] = STRATEGY_LEGACY
 
         if _requests_surface_effect(prompt):
             result = self._apply_liquid_surface_recovery(
@@ -3568,4 +4019,4 @@ class FaceIdentityMasker:
             result.metadata.setdefault("liquid_recovery_applied", False)
             result.metadata.setdefault("liquid_recovery_reason", "not-requested")
 
-        return result
+        return self._standardize_result_metadata(result, decision, intent, drift_assessment, fallback_reason)
