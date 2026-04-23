@@ -57,8 +57,10 @@ The Runpod handler accepts payloads like this:
     "quality_mode": "balanced",
     "rewrite_prompt": false,
     "lock_face_identity": true,
+    "face_mask_strategy": "auto",
+    "face_mask_mode": "strict",
     "face_mask_strength": 0.86,
-    "body_cleanup": true,
+    "body_cleanup": false,
     "body_cleanup_strength": 0.45,
     "debug_masks": false,
     "postprocess_upscale_mode": "detail",
@@ -144,8 +146,10 @@ The client lets you:
 - upload one image
 - enter a prompt
 - keep `Lock Face Identity` enabled to preserve the source face during edits
-- the worker now uses one strict, source-dominant identity-lock path when `Lock Face Identity` is enabled
-- keep `Body Cleanup` enabled to run a conservative non-face cleanup pass for body skin speckles, clothing residue, and halo artifacts
+- use `Face Strategy` to test `auto`, `strict_identity`, `smart`, `preserve_skin`, `legacy`, or `off`
+- use `Face Mode` to test `strict`, `balanced`, `surface_fx`, or `off`
+- the worker now routes face rescue by strategy, mode, edit regime, and identity drift instead of forcing one strict path
+- enable `Body Cleanup` only when you want the experimental non-face cleanup pass for body skin speckles, clothing residue, and halo artifacts
 - face-surface prompts such as droplets, sweat, tears, wet skin, makeup, lashes, or glitter get a second recovery pass that transfers only local surface changes back onto the locked face
 - use `Mask Strength` to tune how strongly the source face is preserved
 - use `Cleanup Strength` to tune body cleanup without changing the face
@@ -240,11 +244,11 @@ DEFAULT_NUM_INFERENCE_STEPS=6
 DEFAULT_TRUE_GUIDANCE_SCALE=1.3
 MIN_IDENTITY_TRUE_GUIDANCE_SCALE=1.3
 DEFAULT_REWRITE_PROMPT=false
-FACE_MASK_STRATEGY=strict_identity
+FACE_MASK_STRATEGY=auto
 FACE_MASK_MODE=strict
 FACE_MASK_STRENGTH=0.86
 FACE_MASK_DEBUG=false
-BODY_CLEANUP=true
+BODY_CLEANUP=false
 BODY_CLEANUP_STRENGTH=0.45
 IDENTITY_DRIFT_AUTO_RETRY=true
 IDENTITY_DRIFT_THRESHOLD=0.26
@@ -285,7 +289,9 @@ Optional:
 - `IDENTITY_DRIFT_AUTO_RETRY=true`: runs one extra generation pass only when the finished face still drifts too far from the source after masking.
 - `IDENTITY_DRIFT_THRESHOLD`: lower this if you want the retry to trigger more aggressively.
 - `IDENTITY_RETRY_GUIDANCE_BOOST`, `IDENTITY_RETRY_STEP_BOOST`, `IDENTITY_RETRY_MASK_STRENGTH_BOOST`: tune how hard the retry leans toward preserving the original face.
-- `BODY_CLEANUP=true`: runs a deterministic non-face cleanup pass after the first face lock, then reapplies face lock.
+- `FACE_MASK_STRATEGY`: use `auto` for the new router, or force `strict_identity`, `smart`, `preserve_skin`, `legacy`, or `off`.
+- `FACE_MASK_MODE`: use `strict`, `balanced`, `surface_fx`, or `off`.
+- `BODY_CLEANUP=true`: runs the experimental deterministic non-face cleanup pass after the first face lock, then reapplies face lock.
 - `BODY_CLEANUP_STRENGTH`: lower it if skin gets too smooth, raise it slightly if speckles or clothing residue remain.
 
 You can copy these from `.env.runpod.example`.

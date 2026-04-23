@@ -125,6 +125,8 @@ def _build_request_payload(
     quality_mode: str,
     rewrite_prompt: bool,
     lock_face_identity: bool,
+    face_mask_strategy: str,
+    face_mask_mode: str,
     face_mask_strength: float,
     body_cleanup: bool,
     body_cleanup_strength: float,
@@ -144,6 +146,8 @@ def _build_request_payload(
             "quality_mode": quality_mode,
             "rewrite_prompt": rewrite_prompt,
             "lock_face_identity": lock_face_identity,
+            "face_mask_strategy": face_mask_strategy,
+            "face_mask_mode": face_mask_mode,
             "face_mask_strength": face_mask_strength,
             "body_cleanup": body_cleanup,
             "body_cleanup_strength": body_cleanup_strength,
@@ -177,6 +181,8 @@ def build_payload(
     quality_mode: str,
     rewrite_prompt: bool,
     lock_face_identity: bool,
+    face_mask_strategy: str,
+    face_mask_mode: str,
     face_mask_strength: float,
     body_cleanup: bool,
     body_cleanup_strength: float,
@@ -215,6 +221,8 @@ def build_payload(
                 quality_mode=quality_mode,
                 rewrite_prompt=rewrite_prompt,
                 lock_face_identity=lock_face_identity,
+                face_mask_strategy=face_mask_strategy,
+                face_mask_mode=face_mask_mode,
                 face_mask_strength=face_mask_strength,
                 body_cleanup=body_cleanup,
                 body_cleanup_strength=body_cleanup_strength,
@@ -337,6 +345,8 @@ def run_inference(
     quality_mode: str,
     rewrite_prompt: bool,
     lock_face_identity: bool,
+    face_mask_strategy: str,
+    face_mask_mode: str,
     face_mask_strength: float,
     body_cleanup: bool,
     body_cleanup_strength: float,
@@ -367,6 +377,8 @@ def run_inference(
         quality_mode=quality_mode,
         rewrite_prompt=bool(rewrite_prompt),
         lock_face_identity=bool(lock_face_identity),
+        face_mask_strategy=face_mask_strategy,
+        face_mask_mode=face_mask_mode,
         face_mask_strength=float(face_mask_strength),
         body_cleanup=bool(body_cleanup),
         body_cleanup_strength=float(body_cleanup_strength),
@@ -393,6 +405,8 @@ def run_inference(
         first_drift = first_mask.get("identity_drift") or {}
         body_cleanup_items = output.get("body_cleanup") or []
         first_cleanup = body_cleanup_items[0] if body_cleanup_items else {}
+        strategy_text = first_mask.get("strategy_used") or first_mask.get("strategy_requested") or output.get("face_mask_strategy", "n/a")
+        mode_text = first_mask.get("mode_used") or first_mask.get("mode") or output.get("face_mask_mode", "n/a")
         delivered_resolution_text = (
             f"{first_image.get('width', 'n/a')}x{first_image.get('height', 'n/a')}"
             if first_image
@@ -419,7 +433,8 @@ def run_inference(
             f"{input_upload_meta.get('upload_format', 'n/a')}"
             f"{upload_quality_text} "
             f"({input_upload_meta.get('request_body_bytes', 'n/a')} bytes)\n"
-            f"Mask: {first_mask.get('engine', 'n/a')} / {output.get('face_mask_strategy', 'n/a')} / {output.get('face_mask_mode', 'n/a')}\n"
+            f"Mask: {first_mask.get('engine', 'n/a')} / {strategy_text} / {mode_text}\n"
+            f"Regime: {first_mask.get('edit_regime', 'n/a')} ({first_mask.get('routing_reason', 'n/a')})\n"
             f"Quality: {generation.get('quality_mode', 'n/a')} ({generation.get('prompt_intent', 'n/a')})\n"
             f"Source target: {source_target_resolution_text}\n"
             f"Generated: {generated_resolution_text}\n"
@@ -474,8 +489,18 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
         with gr.Row():
             rewrite_prompt = gr.Checkbox(label="Rewrite Prompt", value=False)
             lock_face_identity = gr.Checkbox(label="Lock Face Identity", value=True)
+            face_mask_strategy = gr.Dropdown(
+                label="Face Strategy",
+                choices=["auto", "strict_identity", "smart", "preserve_skin", "legacy", "off"],
+                value="auto",
+            )
+            face_mask_mode = gr.Dropdown(
+                label="Face Mode",
+                choices=["strict", "balanced", "surface_fx", "off"],
+                value="strict",
+            )
             face_mask_strength = gr.Slider(label="Mask Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.86)
-            body_cleanup = gr.Checkbox(label="Body Cleanup", value=True)
+            body_cleanup = gr.Checkbox(label="Body Cleanup", value=False)
             body_cleanup_strength = gr.Slider(label="Cleanup Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.45)
             debug_masks = gr.Checkbox(label="Debug Masks", value=False)
             num_images_per_prompt = gr.Slider(label="Images Per Prompt", minimum=1, maximum=4, step=1, value=1)
@@ -510,6 +535,8 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
             quality_mode,
             rewrite_prompt,
             lock_face_identity,
+            face_mask_strategy,
+            face_mask_mode,
             face_mask_strength,
             body_cleanup,
             body_cleanup_strength,

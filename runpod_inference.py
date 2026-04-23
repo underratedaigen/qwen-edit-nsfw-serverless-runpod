@@ -36,9 +36,9 @@ DEFAULT_NATIVE_MAX_LONG_EDGE = 2048
 DEFAULT_GENERATION_SIZE_MULTIPLE = 32
 DEFAULT_QUALITY_MODE = "balanced"
 DEFAULT_POSTPROCESS_UPSCALE_MODE = "detail"
-DEFAULT_FACE_MASK_STRATEGY = "strict_identity"
+DEFAULT_FACE_MASK_STRATEGY = "auto"
 DEFAULT_FACE_MASK_STRENGTH = 0.86
-DEFAULT_BODY_CLEANUP = True
+DEFAULT_BODY_CLEANUP = False
 DEFAULT_BODY_CLEANUP_STRENGTH = 0.45
 DEFAULT_IDENTITY_DRIFT_THRESHOLD = 0.26
 DEFAULT_IDENTITY_RETRY_GUIDANCE_BOOST = 0.28
@@ -424,14 +424,20 @@ def _normalize_quality_mode(value: Any) -> str:
 
 def _normalize_mask_strategy(value: Any) -> str:
     normalized = str(value or DEFAULT_FACE_MASK_STRATEGY).strip().lower()
-    if normalized in {"off", "none"}:
+    if normalized in {"off", "none", "disabled"}:
         return "off"
+    if normalized in {"auto", "strict_identity", "preserve_skin", "smart", "legacy"}:
+        return normalized
     return DEFAULT_FACE_MASK_STRATEGY
 
 
 def _normalize_mask_mode(value: Any) -> str:
     normalized = str(value or "strict").strip().lower()
-    return "off" if normalized == "off" else "strict"
+    if normalized in {"off", "none", "disabled"}:
+        return "off"
+    if normalized in {"strict", "balanced", "surface_fx"}:
+        return normalized
+    return "strict"
 
 
 def _normalize_upscale_mode(value: Any) -> str:
@@ -1745,8 +1751,19 @@ class QwenRunpodService:
         num_images_per_prompt = _to_int(job_input.get("num_images_per_prompt"), 1)
         rewrite_prompt = _to_bool(job_input.get("rewrite_prompt"), self.config.default_rewrite_prompt)
         enforce_identity_lock = _to_bool(job_input.get("lock_face_identity"), self.config.lock_face_identity)
-        face_mask_mode = "strict" if enforce_identity_lock else "off"
-        face_mask_strategy = DEFAULT_FACE_MASK_STRATEGY if enforce_identity_lock else "off"
+        requested_face_mask_strategy = _normalize_mask_strategy(
+            job_input.get("face_mask_strategy", self.config.face_mask_strategy)
+        )
+        requested_face_mask_mode = _normalize_mask_mode(
+            job_input.get("face_mask_mode", self.config.face_mask_mode)
+        )
+        if enforce_identity_lock and requested_face_mask_strategy != "off" and requested_face_mask_mode != "off":
+            face_mask_strategy = requested_face_mask_strategy
+            face_mask_mode = requested_face_mask_mode
+        else:
+            face_mask_strategy = "off"
+            face_mask_mode = "off"
+            enforce_identity_lock = False
         face_mask_strength = _clamp_float(
             _to_float(job_input.get("face_mask_strength"), self.config.face_mask_strength),
             0.0,
