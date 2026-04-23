@@ -48,6 +48,9 @@ DEBUG_REGION_COLORS = {
     "core": (244, 63, 94),
     "contour": (251, 191, 36),
     "hairline": (168, 85, 247),
+    "cleanup": (34, 197, 94),
+    "artifact": (249, 115, 22),
+    "exclusion": (59, 130, 246),
 }
 PARSER_LABEL_COLORS = {
     "background": (0, 0, 0),
@@ -803,6 +806,41 @@ def _detect_exposed_skin_mask(image: Image.Image) -> Image.Image:
         blur_radius=max(1.5, base / 360.0),
     )
     return pil_mask
+
+
+def _detect_body_skin_candidate_mask(image: Image.Image) -> Image.Image:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+    hsv = np.asarray(image.convert("HSV"), dtype=np.float32)
+    r = rgb[..., 0]
+    g = rgb[..., 1]
+    b = rgb[..., 2]
+    hue = hsv[..., 0]
+    sat = hsv[..., 1]
+    val = hsv[..., 2]
+    maxc = np.max(rgb, axis=2)
+    minc = np.min(rgb, axis=2)
+    chroma = maxc - minc
+
+    warm_hue = (hue <= 34) | (hue >= 235)
+    broad_skin_rgb = (
+        (r > 35)
+        & (g > 22)
+        & (b > 14)
+        & (chroma > 7)
+        & (r >= b * 0.82)
+        & (g >= b * 0.52)
+        & (r >= g * 0.72)
+    )
+    light_skin = (val > 118) & (sat >= 8) & (sat <= 126) & (r >= g * 0.92) & (r >= b * 1.02)
+    medium_dark_skin = (val > 42) & (sat >= 22) & (sat <= 190) & (r >= b * 0.92) & (g >= b * 0.55)
+    low_sat_highlight = (val > 185) & (sat <= 58) & (r >= b * 1.02) & (g >= b * 0.82)
+    skin = warm_hue & broad_skin_rgb & (light_skin | medium_dark_skin | low_sat_highlight)
+
+    mask = Image.fromarray((skin.astype(np.uint8) * 255), mode="L")
+    base = max(image.size)
+    mask = _contract_mask(mask, contract_px=max(1, int(base / 760)), blur_radius=max(0.8, base / 620.0))
+    mask = _expand_mask(mask, expand_px=max(1, int(base / 540)), blur_radius=max(1.1, base / 460.0))
+    return mask
 
 
 @dataclass
@@ -3206,6 +3244,287 @@ class FaceIdentityMasker:
             mode=protected_result.mode,
             reason=f"{protected_result.reason}; {effect_label}-recovery",
             engine=protected_result.engine,
+            metadata=metadata,
+            debug_images=debug_images,
+        )
+
+    def cleanup_body_artifacts(
+        self,
+        source_image: Image.Image,
+        generated_image: Image.Image,
+        strength: float = 0.45,
+        debug: bool = False,
+    ) -> FaceMaskResult:
+        generated_rgb = generated_image.convert("RGB")
+        base = max(generated_rgb.size)
+        clamped_strength = float(np.clip(strength, 0.0, 1.0))
+
+        aligned_source, source_landmarks, generated_landmarks, alignment_method = self._align_source_to_generated(
+            source_image,
+            generated_rgb,
+        )
+        if not source_landmarks:
+            return FaceMaskResult(
+                image=generated_rgb,
+                applied=False,
+                mode="body_cleanup",
+                reason="no-source-face",
+                engine="body_cleanup",
+                metadata={"body_cleanup_applied": False, "body_cleanup_reason": "no-source-face"},
+            )
+        if not generated_landmarks:
+            return FaceMaskResult(
+                image=generated_rgb,
+                applied=False,
+                mode="body_cleanup",
+                reason="no-output-face",
+                engine="body_cleanup",
+                metadata={"body_cleanup_applied": False, "body_cleanup_reason": "no-output-face"},
+            )
+
+        face_mask, core_mask, contour_mask = self._build_legacy_masks(generated_rgb.size, generated_landmarks)
+        face_exclusion_mask = _expand_mask(
+            _union_masks(face_mask, core_mask, contour_mask),
+            expand_px=max(8, int(base / 72)),
+            blur_radius=max(3.0, base / 118.0),
+        )
+
+        face_bbox = self._face_bbox(generated_landmarks)
+        person_region_mask = Image.new("L", generated_rgb.size, 255)
+        if face_bbox is not None:
+            x1, y1, x2, y2 = face_bbox
+            face_width = max(1.0, x2 - x1)
+            face_height = max(1.0, y2 - y1)
+            person_region_mask = Image.new("L", generated_rgb.size, 0)
+            person_draw = ImageDraw.Draw(person_region_mask)
+            center_x = (x1 + x2) / 2.0
+            horizontal_extent = max(face_width * 4.8, generated_rgb.width * 0.42)
+            top = max(0.0, y1 - (face_height * 0.46))
+            person_draw.rectangle(
+                (
+                    max(0.0, center_x - horizontal_extent),
+                    top,
+                    min(float(generated_rgb.width), center_x + horizontal_extent),
+                    float(generated_rgb.height),
+                ),
+                fill=255,
+            )
+            person_region_mask = _expand_mask(person_region_mask, expand_px=0, blur_radius=max(2.0, base / 220.0))
+            head_guard = _mask_from_ellipse(
+                generated_rgb.size,
+                center=((x1 + x2) / 2.0, ((y1 + y2) / 2.0) - (face_height * 0.12)),
+                radius_x=face_width * 0.86,
+                radius_y=face_height * 1.24,
+                blur_radius=max(2.5, base / 160.0),
+            )
+            face_exclusion_mask = _union_masks(face_exclusion_mask, head_guard)
+
+        parser_error: str | None = None
+        parser_face: ParserFaceData | None = None
+        try:
+            parser_face = self._parse_face_regions(generated_rgb)
+            parser_head_mask = _union_masks(
+                _mask_from_labels(
+                    parser_face.labels,
+                    parser_face.label_names,
+                    PARSER_FACE_REGION_LABELS,
+                    expand_px=max(4, int(base / 180)),
+                    blur_radius=max(2.5, base / 190.0),
+                ),
+                _mask_from_labels(
+                    parser_face.labels,
+                    parser_face.label_names,
+                    PARSER_HAIR_LABELS,
+                    expand_px=max(5, int(base / 170)),
+                    blur_radius=max(2.5, base / 190.0),
+                ),
+            )
+            face_exclusion_mask = _union_masks(
+                face_exclusion_mask,
+                _expand_mask(
+                    parser_head_mask,
+                    expand_px=max(5, int(base / 110)),
+                    blur_radius=max(2.5, base / 150.0),
+                ),
+            )
+        except Exception as exc:
+            parser_error = str(exc)
+
+        skin_candidate_mask = _detect_body_skin_candidate_mask(generated_rgb)
+        body_skin_mask = _subtract_masks(
+            skin_candidate_mask,
+            face_exclusion_mask,
+            blur_radius=max(1.0, base / 460.0),
+        )
+        body_skin_mask = _intersect_masks(body_skin_mask, person_region_mask)
+        body_skin_mask = _contract_mask(
+            body_skin_mask,
+            contract_px=max(1, int(base / 780)),
+            blur_radius=max(0.8, base / 620.0),
+        )
+        body_skin_mask = _expand_mask(
+            body_skin_mask,
+            expand_px=max(1, int(base / 680)),
+            blur_radius=max(1.0, base / 520.0),
+        )
+
+        body_alpha_base = np.asarray(body_skin_mask, dtype=np.float32) / 255.0
+        body_bool = body_alpha_base > 0.12
+        min_pixels = max(96, int(generated_rgb.width * generated_rgb.height * 0.0015))
+        if int(body_bool.sum()) < min_pixels:
+            metadata = {
+                "body_cleanup_applied": False,
+                "body_cleanup_reason": "no-safe-body-skin-region",
+                "body_cleanup_alignment_method": alignment_method,
+                "body_cleanup_skin_candidate_coverage": round(float((np.asarray(skin_candidate_mask) > 0).mean()), 4),
+                "body_cleanup_face_exclusion_coverage": round(float((np.asarray(face_exclusion_mask) > 0).mean()), 4),
+            }
+            if parser_error:
+                metadata["body_cleanup_parser_fallback"] = parser_error
+            return FaceMaskResult(
+                image=generated_rgb,
+                applied=False,
+                mode="body_cleanup",
+                reason="no-safe-body-skin-region",
+                engine="body_cleanup",
+                metadata=metadata,
+                debug_images=(
+                    {
+                        "cleanup_candidate_mask": skin_candidate_mask.convert("L"),
+                        "cleanup_final_mask": body_skin_mask.convert("L"),
+                        "face_exclusion_mask": face_exclusion_mask.convert("L"),
+                    }
+                    if debug
+                    else {}
+                ),
+            )
+
+        image_array = np.asarray(generated_rgb, dtype=np.float32)
+        median3_array = np.asarray(generated_rgb.filter(ImageFilter.MedianFilter(size=3)), dtype=np.float32)
+        median5_array = np.asarray(generated_rgb.filter(ImageFilter.MedianFilter(size=5)), dtype=np.float32)
+        soft_array = _blur_rgb_array(image_array, radius=max(0.65, base / 1500.0))
+        low_array = _blur_rgb_array(image_array, radius=max(4.0, base / 170.0))
+
+        luma = _luminance_array(image_array)
+        low_luma = _luminance_array(low_array)
+        smooth_luma = _luminance_array(_blur_rgb_array(image_array, radius=max(1.2, base / 720.0)))
+        grad_y, grad_x = np.gradient(smooth_luma)
+        gradient = np.hypot(grad_x, grad_y)
+
+        detail_to_median = np.mean(np.abs(image_array - median3_array), axis=2)
+        detail_to_soft = np.mean(np.abs(image_array - soft_array), axis=2)
+        broad_luma_delta = np.abs(luma - low_luma)
+
+        region_detail = detail_to_median[body_bool]
+        region_soft = detail_to_soft[body_bool]
+        region_broad = broad_luma_delta[body_bool]
+        region_gradient = gradient[body_bool]
+        detail_floor = float(max(4.2, np.percentile(region_detail, 82)))
+        soft_floor = float(max(2.8, np.percentile(region_soft, 76)))
+        broad_floor = float(max(5.0, np.percentile(region_broad, 82)))
+        gradient_floor = float(max(5.0, np.percentile(region_gradient, 78)))
+        gradient_high = float(max(gradient_floor + 1.0, np.percentile(region_gradient, 94)))
+
+        speckle_candidate = body_bool & (
+            (detail_to_median >= detail_floor)
+            | ((detail_to_soft >= soft_floor) & (broad_luma_delta >= broad_floor * 0.45))
+        )
+        halo_candidate = body_bool & (
+            (broad_luma_delta >= broad_floor)
+            & (gradient >= gradient_floor)
+            & (detail_to_soft >= soft_floor * 0.55)
+        )
+        artifact_bool = speckle_candidate | halo_candidate
+        artifact_mask = Image.fromarray((artifact_bool.astype(np.uint8) * 255), mode="L")
+        artifact_mask = _expand_mask(
+            artifact_mask,
+            expand_px=max(1, int(base / 620)),
+            blur_radius=max(1.0, base / 520.0),
+        )
+        artifact_mask = _intersect_masks(
+            artifact_mask,
+            _expand_mask(body_skin_mask, 0, max(0.8, base / 620.0)),
+        )
+
+        cleanup_target = np.clip((median3_array * 0.56) + (median5_array * 0.18) + (soft_array * 0.18) + (image_array * 0.08), 0, 255)
+        target_low = _blur_rgb_array(cleanup_target, radius=max(4.0, base / 170.0))
+        cleanup_target = np.clip(cleanup_target + ((low_array - target_low) * 0.86), 0, 255)
+
+        interior_body_mask = _contract_mask(
+            body_skin_mask,
+            contract_px=max(1, int(base / 520)),
+            blur_radius=max(0.8, base / 620.0),
+        )
+        body_alpha = _mask_to_array(interior_body_mask) * (0.07 + (0.16 * clamped_strength))
+        artifact_alpha = _mask_to_array(artifact_mask) * (0.30 + (0.44 * clamped_strength))
+        cleanup_alpha = np.maximum(body_alpha, artifact_alpha)
+
+        gradient_norm = np.clip((gradient - gradient_floor) / max(gradient_high - gradient_floor, 1.0), 0.0, 1.0)
+        edge_protection = 1.0 - (0.42 * gradient_norm[..., None])
+        cleanup_alpha = cleanup_alpha * edge_protection
+        cleanup_alpha = np.clip(cleanup_alpha, 0.0, 0.78)
+
+        if float(cleanup_alpha.max()) <= 0.0:
+            return FaceMaskResult(
+                image=generated_rgb,
+                applied=False,
+                mode="body_cleanup",
+                reason="empty-cleanup-alpha",
+                engine="body_cleanup",
+                metadata={"body_cleanup_applied": False, "body_cleanup_reason": "empty-cleanup-alpha"},
+            )
+
+        cleaned = np.clip((image_array * (1.0 - cleanup_alpha)) + (cleanup_target * cleanup_alpha), 0, 255)
+        cleaned_image = Image.fromarray(cleaned.astype(np.uint8), mode="RGB")
+        cleanup_final_mask = Image.fromarray((np.clip(cleanup_alpha[..., 0] * 255.0, 0, 255)).astype(np.uint8), mode="L")
+
+        artifact_coverage = float((np.asarray(artifact_mask, dtype=np.uint8) > 0).mean())
+        cleanup_coverage = float((np.asarray(cleanup_final_mask, dtype=np.uint8) > 6).mean())
+        metadata = {
+            "body_cleanup_applied": True,
+            "body_cleanup_reason": "deterministic-non-face-skin-cleanup",
+            "body_cleanup_strength": round(clamped_strength, 3),
+            "body_cleanup_alignment_method": alignment_method,
+            "body_cleanup_skin_candidate_coverage": round(float((np.asarray(skin_candidate_mask) > 0).mean()), 4),
+            "body_cleanup_body_skin_coverage": round(float(body_bool.mean()), 4),
+            "body_cleanup_artifact_coverage": round(artifact_coverage, 4),
+            "body_cleanup_mask_coverage": round(cleanup_coverage, 4),
+            "body_cleanup_face_exclusion_coverage": round(float((np.asarray(face_exclusion_mask) > 0).mean()), 4),
+            "body_cleanup_detail_floor": round(detail_floor, 3),
+            "body_cleanup_broad_floor": round(broad_floor, 3),
+        }
+        if parser_face is not None and parser_face.score is not None:
+            metadata["body_cleanup_parser_score"] = parser_face.score
+        if parser_error:
+            metadata["body_cleanup_parser_fallback"] = parser_error
+
+        debug_images: Dict[str, Image.Image] = {}
+        if debug:
+            before_after = Image.new("RGB", (generated_rgb.width * 2, generated_rgb.height), (0, 0, 0))
+            before_after.paste(generated_rgb, (0, 0))
+            before_after.paste(cleaned_image, (generated_rgb.width, 0))
+            debug_images = {
+                "cleanup_candidate_mask": skin_candidate_mask.convert("L"),
+                "cleanup_final_mask": cleanup_final_mask.convert("L"),
+                "face_exclusion_mask": face_exclusion_mask.convert("L"),
+                "artifact_detection_mask": artifact_mask.convert("L"),
+                "cleanup_overlay": _overlay_regions(
+                    generated_rgb,
+                    {
+                        "cleanup": cleanup_final_mask,
+                        "artifact": artifact_mask,
+                        "exclusion": face_exclusion_mask,
+                    },
+                ),
+                "cleanup_before_after": before_after,
+            }
+
+        return FaceMaskResult(
+            image=cleaned_image,
+            applied=True,
+            mode="body_cleanup",
+            reason="deterministic-non-face-skin-cleanup",
+            engine="body_cleanup",
             metadata=metadata,
             debug_images=debug_images,
         )

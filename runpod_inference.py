@@ -38,6 +38,8 @@ DEFAULT_QUALITY_MODE = "balanced"
 DEFAULT_POSTPROCESS_UPSCALE_MODE = "detail"
 DEFAULT_FACE_MASK_STRATEGY = "strict_identity"
 DEFAULT_FACE_MASK_STRENGTH = 0.86
+DEFAULT_BODY_CLEANUP = True
+DEFAULT_BODY_CLEANUP_STRENGTH = 0.45
 DEFAULT_IDENTITY_DRIFT_THRESHOLD = 0.26
 DEFAULT_IDENTITY_RETRY_GUIDANCE_BOOST = 0.28
 DEFAULT_IDENTITY_RETRY_STEP_BOOST = 2
@@ -1027,6 +1029,12 @@ class WorkerConfig:
         1.0,
     )
     face_mask_debug: bool = _to_bool(os.environ.get("FACE_MASK_DEBUG"), False)
+    body_cleanup: bool = _to_bool(os.environ.get("BODY_CLEANUP"), DEFAULT_BODY_CLEANUP)
+    body_cleanup_strength: float = _clamp_float(
+        _to_float(os.environ.get("BODY_CLEANUP_STRENGTH"), DEFAULT_BODY_CLEANUP_STRENGTH),
+        0.0,
+        1.0,
+    )
     identity_drift_auto_retry: bool = _to_bool(os.environ.get("IDENTITY_DRIFT_AUTO_RETRY"), True)
     identity_drift_threshold: float = _clamp_float(
         _to_float(os.environ.get("IDENTITY_DRIFT_THRESHOLD"), DEFAULT_IDENTITY_DRIFT_THRESHOLD),
@@ -1496,6 +1504,109 @@ class QwenRunpodService:
 
         return protected_images, metadata, debug_payloads
 
+    def _apply_body_cleanup(
+        self,
+        source_image: Image.Image,
+        images: Sequence[Image.Image],
+        prompt: str,
+        enabled: bool,
+        strength: float,
+        face_mask_mode: str,
+        face_mask_strategy: str,
+        face_mask_strength: float,
+        debug_masks: bool,
+        existing_debug_payloads: Sequence[Dict[str, Image.Image]],
+    ) -> tuple[List[Image.Image], List[Dict[str, Any]], List[Dict[str, Image.Image]]]:
+        if not enabled:
+            metadata = [
+                {
+                    "applied": False,
+                    "reason": "disabled",
+                    "engine": "body_cleanup",
+                    "body_cleanup_applied": False,
+                    "body_cleanup_reason": "disabled",
+                }
+                for _ in images
+            ]
+            return list(images), metadata, list(existing_debug_payloads)
+
+        masker = self._get_face_masker()
+        if masker is False:
+            metadata = [
+                {
+                    "applied": False,
+                    "reason": "masker-unavailable",
+                    "engine": "body_cleanup",
+                    "body_cleanup_applied": False,
+                    "body_cleanup_reason": "masker-unavailable",
+                }
+                for _ in images
+            ]
+            return list(images), metadata, list(existing_debug_payloads)
+
+        cleaned_images: List[Image.Image] = []
+        metadata: List[Dict[str, Any]] = []
+        debug_payloads: List[Dict[str, Image.Image]] = []
+        normalized_mode = (face_mask_mode or "off").strip().lower()
+        relock_face = normalized_mode != "off"
+
+        for index, image in enumerate(images):
+            base_debug = dict(existing_debug_payloads[index]) if index < len(existing_debug_payloads) else {}
+            try:
+                cleanup_result = masker.cleanup_body_artifacts(
+                    source_image=source_image,
+                    generated_image=image,
+                    strength=strength,
+                    debug=debug_masks,
+                )
+            except Exception as exc:
+                cleaned_images.append(image)
+                metadata.append(
+                    {
+                        "applied": False,
+                        "reason": f"cleanup-failed:{exc}",
+                        "engine": "body_cleanup",
+                        "body_cleanup_applied": False,
+                        "body_cleanup_reason": f"cleanup-failed:{exc}",
+                    }
+                )
+                debug_payloads.append(base_debug)
+                continue
+
+            cleaned_image = cleanup_result.image
+            item_metadata: Dict[str, Any] = {
+                "applied": cleanup_result.applied,
+                "reason": cleanup_result.reason,
+                "engine": cleanup_result.engine,
+                **cleanup_result.metadata,
+                "body_cleanup_final_face_relock_applied": False,
+            }
+            base_debug.update(cleanup_result.debug_images)
+
+            if cleanup_result.applied and relock_face:
+                try:
+                    relock_result = masker.protect(
+                        source_image=source_image,
+                        generated_image=cleaned_image,
+                        mode=normalized_mode,
+                        strategy=face_mask_strategy,
+                        strength=face_mask_strength,
+                        prompt=prompt,
+                        debug=False,
+                    )
+                    cleaned_image = relock_result.image
+                    item_metadata["body_cleanup_final_face_relock_applied"] = relock_result.applied
+                    item_metadata["body_cleanup_final_face_relock_engine"] = relock_result.engine
+                    item_metadata["body_cleanup_final_face_relock_reason"] = relock_result.reason
+                except Exception as exc:
+                    item_metadata["body_cleanup_final_face_relock_reason"] = f"relock-failed:{exc}"
+
+            cleaned_images.append(cleaned_image)
+            metadata.append(item_metadata)
+            debug_payloads.append(base_debug)
+
+        return cleaned_images, metadata, debug_payloads
+
     def _serialize_named_images(
         self,
         job_id: str,
@@ -1641,6 +1752,12 @@ class QwenRunpodService:
             0.0,
             1.0,
         )
+        body_cleanup = _to_bool(job_input.get("body_cleanup"), self.config.body_cleanup)
+        body_cleanup_strength = _clamp_float(
+            _to_float(job_input.get("body_cleanup_strength"), self.config.body_cleanup_strength),
+            0.0,
+            1.0,
+        )
         debug_masks = _to_bool(job_input.get("debug_masks"), self.config.face_mask_debug)
         postprocess_upscale_mode = _normalize_upscale_mode(
             job_input.get("postprocess_upscale_mode", self.config.postprocess_upscale_mode)
@@ -1742,6 +1859,7 @@ class QwenRunpodService:
             f"[generation] native size {width}x{height}, steps={num_inference_steps}, "
             f"true_cfg_scale={true_guidance_scale}, quality_mode={quality_mode}, "
             f"mask={face_mask_strategy}/{face_mask_mode}@{round(face_mask_strength, 3)}, "
+            f"body_cleanup={body_cleanup}@{round(body_cleanup_strength, 3)}, "
             f"preserve_source_exact_size={preserve_source_exact_size}, "
             f"source_output_size={source_output_size}, "
             f"preserve_composition={preserve_composition}, "
@@ -1768,6 +1886,7 @@ class QwenRunpodService:
         if canvas_padding is not None:
             output_images = [_crop_image_from_canvas(image, canvas_padding) for image in output_images]
         face_masking: List[Dict[str, Any]]
+        body_cleanup_metadata: List[Dict[str, Any]]
         debug_mask_payloads: List[Dict[str, Image.Image]]
         if images:
             output_images, face_masking, debug_mask_payloads = self._apply_face_masking(
@@ -1779,6 +1898,18 @@ class QwenRunpodService:
                 strength=face_mask_strength,
                 debug_masks=debug_masks,
             )
+            output_images, body_cleanup_metadata, debug_mask_payloads = self._apply_body_cleanup(
+                source_image=images[0],
+                images=output_images,
+                prompt=resolved_prompt,
+                enabled=body_cleanup,
+                strength=body_cleanup_strength,
+                face_mask_mode=face_mask_mode,
+                face_mask_strategy=face_mask_strategy,
+                face_mask_strength=face_mask_strength,
+                debug_masks=debug_masks,
+                existing_debug_payloads=debug_mask_payloads,
+            )
         else:
             face_masking = [
                 {
@@ -1787,6 +1918,16 @@ class QwenRunpodService:
                     "reason": "no-source-image",
                     "engine": "none",
                     "strategy_requested": face_mask_strategy,
+                }
+                for _ in output_images
+            ]
+            body_cleanup_metadata = [
+                {
+                    "applied": False,
+                    "reason": "no-source-image",
+                    "engine": "body_cleanup",
+                    "body_cleanup_applied": False,
+                    "body_cleanup_reason": "no-source-image",
                 }
                 for _ in output_images
             ]
@@ -1848,6 +1989,7 @@ class QwenRunpodService:
             "face_mask_mode": face_mask_mode,
             "face_mask_strategy": face_mask_strategy,
             "face_masking": face_masking,
+            "body_cleanup": body_cleanup_metadata,
             "debug_masks": serialized_debug_masks,
             "num_images": len(image_payloads),
             "images": image_payloads,
@@ -1876,6 +2018,8 @@ class QwenRunpodService:
                 "num_inference_steps": num_inference_steps,
                 "true_guidance_scale": true_guidance_scale,
                 "quality_mode": quality_mode,
+                "body_cleanup": body_cleanup,
+                "body_cleanup_strength": body_cleanup_strength,
                 "prompt_intent": prompt_intent,
                 "face_coverage": round(face_coverage, 4) if face_coverage is not None else None,
                 "attempts": generation_attempts,

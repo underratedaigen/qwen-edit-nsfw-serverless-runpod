@@ -126,6 +126,8 @@ def _build_request_payload(
     rewrite_prompt: bool,
     lock_face_identity: bool,
     face_mask_strength: float,
+    body_cleanup: bool,
+    body_cleanup_strength: float,
     debug_masks: bool,
     postprocess_upscale_mode: str,
     width: str,
@@ -143,6 +145,8 @@ def _build_request_payload(
             "rewrite_prompt": rewrite_prompt,
             "lock_face_identity": lock_face_identity,
             "face_mask_strength": face_mask_strength,
+            "body_cleanup": body_cleanup,
+            "body_cleanup_strength": body_cleanup_strength,
             "debug_masks": debug_masks,
             "postprocess_upscale_mode": postprocess_upscale_mode,
             "num_images_per_prompt": num_images_per_prompt,
@@ -174,6 +178,8 @@ def build_payload(
     rewrite_prompt: bool,
     lock_face_identity: bool,
     face_mask_strength: float,
+    body_cleanup: bool,
+    body_cleanup_strength: float,
     debug_masks: bool,
     postprocess_upscale_mode: str,
     width: str,
@@ -210,6 +216,8 @@ def build_payload(
                 rewrite_prompt=rewrite_prompt,
                 lock_face_identity=lock_face_identity,
                 face_mask_strength=face_mask_strength,
+                body_cleanup=body_cleanup,
+                body_cleanup_strength=body_cleanup_strength,
                 debug_masks=debug_masks,
                 postprocess_upscale_mode=postprocess_upscale_mode,
                 width=width,
@@ -330,6 +338,8 @@ def run_inference(
     rewrite_prompt: bool,
     lock_face_identity: bool,
     face_mask_strength: float,
+    body_cleanup: bool,
+    body_cleanup_strength: float,
     debug_masks: bool,
     postprocess_upscale_mode: str,
     width: str,
@@ -358,6 +368,8 @@ def run_inference(
         rewrite_prompt=bool(rewrite_prompt),
         lock_face_identity=bool(lock_face_identity),
         face_mask_strength=float(face_mask_strength),
+        body_cleanup=bool(body_cleanup),
+        body_cleanup_strength=float(body_cleanup_strength),
         debug_masks=bool(debug_masks),
         postprocess_upscale_mode=postprocess_upscale_mode,
         width=width,
@@ -379,6 +391,8 @@ def run_inference(
         face_masking = output.get("face_masking") or []
         first_mask = face_masking[0] if face_masking else {}
         first_drift = first_mask.get("identity_drift") or {}
+        body_cleanup_items = output.get("body_cleanup") or []
+        first_cleanup = body_cleanup_items[0] if body_cleanup_items else {}
         delivered_resolution_text = (
             f"{first_image.get('width', 'n/a')}x{first_image.get('height', 'n/a')}"
             if first_image
@@ -411,6 +425,7 @@ def run_inference(
             f"Generated: {generated_resolution_text}\n"
             f"Delivered: {delivered_resolution_text}\n"
             f"Identity drift: {first_drift.get('score', 'n/a')}\n"
+            f"Body cleanup: {'used' if first_cleanup.get('body_cleanup_applied') else first_cleanup.get('body_cleanup_reason', 'n/a')}\n"
             f"Surface effects: {'used' if first_mask.get('surface_effect_recovery_applied') else first_mask.get('surface_effect_recovery_reason', first_mask.get('liquid_recovery_reason', 'not requested'))}\n"
             f"Face coverage: {generation.get('face_coverage', 'n/a')}\n"
             f"Attempts: {attempt_count}\n"
@@ -430,7 +445,7 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
     gr.Markdown(
         "Upload one image, enter a prompt, and test your Runpod endpoint. "
         "The worker now uses a strict identity-lock path, source-dominant face reinforcement, optional face-surface recovery for wet or makeup-style prompts, "
-        "adaptive quality planning, and debug masks."
+        "non-face body cleanup for skin/clothing artifacts, adaptive quality planning, and debug masks."
     )
 
     with gr.Row():
@@ -460,6 +475,8 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
             rewrite_prompt = gr.Checkbox(label="Rewrite Prompt", value=False)
             lock_face_identity = gr.Checkbox(label="Lock Face Identity", value=True)
             face_mask_strength = gr.Slider(label="Mask Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.86)
+            body_cleanup = gr.Checkbox(label="Body Cleanup", value=True)
+            body_cleanup_strength = gr.Slider(label="Cleanup Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.45)
             debug_masks = gr.Checkbox(label="Debug Masks", value=False)
             num_images_per_prompt = gr.Slider(label="Images Per Prompt", minimum=1, maximum=4, step=1, value=1)
             output_format = gr.Dropdown(label="Output Format", choices=["png", "jpeg"], value="png")
@@ -494,6 +511,8 @@ with gr.Blocks(title="Runpod Qwen Image Test Client") as demo:
             rewrite_prompt,
             lock_face_identity,
             face_mask_strength,
+            body_cleanup,
+            body_cleanup_strength,
             debug_masks,
             postprocess_upscale_mode,
             width,
